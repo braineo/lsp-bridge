@@ -1142,18 +1142,36 @@ you can customize `lsp-bridge-get-project-path-by-filepath' to return project pa
                     :background-color (lsp-bridge-frame-background-color))))
     (lsp-bridge-hide-signature-tooltip)))
 
-(defun lsp-bridge-signature-help-update (help-infos help-index)
-  (let ((index 0)
-        (help ""))
-    (dolist (help-info help-infos)
-      (setq help (concat help
-                         (propertize help-info 'face (if (equal index help-index) 'font-lock-function-name-face 'default))
-                         (if (equal index (1- (length help-infos))) "" ", ")))
-      (setq index (1+ index)))
+(defun lsp-bridge-signature-help-update (fn-signature help-infos help-index)
+  (let* ((help fn-signature)
+         (active-param (nth help-index help-infos))
+         (data (match-data)))
+    (print help)
+    (print active-param)
+    (unwind-protect
+      (setq help (propertize fn-signature 'face 'default))
+      (if (string-match (regexp-quote active-param) fn-signature)
+        (put-text-property
+          (car (match-data 0))
+          (+ (car (match-data 0)) (length active-param))
+          'face 'font-lock-function-name-face help))
+      (set-match-data data))
 
     (unless (string-equal help "")
-      (let ((message-log-max nil))
-        (funcall lsp-bridge-signature-function help)))))
+        (let ((message-log-max nil))
+          (funcall lsp-bridge-signature-function help)))))
+
+  ;; (let ((index 0)
+  ;;       (help ""))
+  ;;   (dolist (help-info help-infos)
+  ;;     (setq help (concat help
+  ;;                        (propertize help-info 'face (if (equal index help-index) 'font-lock-function-name-face 'default))
+  ;;                        (if (equal index (1- (length help-infos))) "" ", ")))
+  ;;     (setq index (1+ index)))
+
+  ;;   (unless (string-equal help "")
+  ;;     (let ((message-log-max nil))
+  ;;       (funcall lsp-bridge-signature-function help)))))
 
 (defvar lsp-bridge--last-buffer nil)
 
