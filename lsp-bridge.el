@@ -1142,8 +1142,10 @@ you can customize `lsp-bridge-get-project-path-by-filepath' to return project pa
                     :background-color (lsp-bridge-frame-background-color))))
     (lsp-bridge-hide-signature-tooltip)))
 
-(defun lsp-bridge-eldoc-function (&rest _))
+(defun lsp-bridge-eldoc-function (callback &rest _)
+  (funcall callback lsp-bridge-eldoc-message))
 
+(defvar-local lsp-bridge-eldoc-message nil)
 (defun lsp-bridge-signature-help-update (fn-signature help-infos help-index)
   (let* ((help fn-signature)
          (active-param (nth help-index help-infos))
@@ -1158,10 +1160,14 @@ you can customize `lsp-bridge-get-project-path-by-filepath' to return project pa
           'face 'font-lock-function-name-face help))
       (set-match-data data))
 
-    (if (string-equal help "")
+    (if (not (string-equal help ""))
+      (progn
         (let ((message-log-max nil))
-          (funcall lsp-bridge-signature-function help))
-        (funcall lsp-bridge-signature-function nil))))
+          (setq-local lsp-bridge-eldoc-message help)
+          (funcall lsp-bridge-signature-function help)))
+      (progn
+        (setq-local lsp-bridge-eldoc-message nil)
+        (funcall lsp-bridge-signature-function nil)))))
 
   ;; (let ((index 0)
   ;;       (help ""))
