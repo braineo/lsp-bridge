@@ -1119,6 +1119,13 @@ you can customize `lsp-bridge-get-project-path-by-filepath' to return project pa
   :type 'function
   :group 'lsp-bridge)
 
+(defcustom lsp-bridge-signature-level "compact"
+  "Information level.
+When it is `compact', only show signature inside a function.
+When it is `full', show full function signature"
+  :type 'function
+  :group 'lsp-bridge)
+
 (defcustom lsp-bridge-signature-tooltip " *lsp-bridge-signature*"
   "Buffer for display signature information."
   :type 'string
