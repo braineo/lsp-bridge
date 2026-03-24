@@ -1,0 +1,23 @@
+[package]
+name = "lsp-bridge"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "lsp-bridge"
+path = "src/main.rs"
+
+[dependencies]
+epc = { workspace = true }
+lsp-server = { workspace = true }
+handlers = { workspace = true }
+backends = { workspace = true }
+remote = { workspace = true }
+search = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "crates/lsp-bridge",
+    "crates/epc",
+    "crates/lsp-server",
+    "crates/handlers",
+    "crates/backends",
+    "crates/remote",
+    "crates/search",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lsp-types = "0.97"
+reqwest = { version = "0.12", features = ["json"] }
+russh = "0.46"
+russh-keys = "0.46"
+notify = "7"
+nucleo-matcher = "0.3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "2"
+anyhow = "1"
+dashmap = "6"
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+async-trait = "0.1"
+regex = "1"
+
+# Internal crates
+epc = { path = "crates/epc" }
+lsp-server = { path = "crates/lsp-server" }
+handlers = { path = "crates/handlers" }
+backends = { path = "crates/backends" }
+remote = { path = "crates/remote" }
+search = { path = "crates/search" }
