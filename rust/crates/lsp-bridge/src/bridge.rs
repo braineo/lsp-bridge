@@ -464,6 +464,85 @@ impl LspBridge {
             None => return Ok(()),
         };
 
+        // Handle FileAction internal methods (not LSP handlers).
+        // These mirror Python's FileAction.change_file, save_file, etc.
+        match method {
+            "change_file" => {
+                // Args: [filepath, start, end, range_length, change_text, position, before_char, buffer_name, prefix]
+                // Sends textDocument/didChange to LSP servers
+                let servers = file_action.get_lsp_servers();
+                let version = file_action.version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as i32;
+                for server in &servers {
+                    let flags = server.capability_flags.read().await;
+                    let sync_kind = flags.text_document_sync_kind;
+                    let uri = lsp_server::server::path_to_uri(Path::new(&filepath));
+
+                    if sync_kind == lsp_types::TextDocumentSyncKind::NONE {
+                        continue;
+                    } else if sync_kind == lsp_types::TextDocumentSyncKind::FULL {
+                        // Full sync: send entire file content
+                        let text = std::fs::read_to_string(&filepath).unwrap_or_default();
+                        let _ = server.send_did_change_full(&uri, version, &text);
+                    } else {
+                        // Incremental sync
+                        let start = json_args.get(1).cloned().unwrap_or(Value::Null);
+                        let end = json_args.get(2).cloned().unwrap_or(Value::Null);
+                        let range_length = json_args.get(3).and_then(|v| v.as_u64()).unwrap_or(0);
+                        let change_text = json_args.get(4).and_then(|v| v.as_str()).unwrap_or("");
+                        let _ = server.send_did_change_incremental(
+                            &uri, version, start, end, range_length, change_text,
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            "update_file" => {
+                // Full file resync — send entire buffer content
+                let servers = file_action.get_lsp_servers();
+                let version = file_action.version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as i32;
+                // Args: [filepath, buffer_name, ...]
+                // For now, read file from disk
+                let text = std::fs::read_to_string(&filepath).unwrap_or_default();
+                let uri = lsp_server::server::path_to_uri(Path::new(&filepath));
+                for server in &servers {
+                    let _ = server.send_did_change_full(&uri, version, &text);
+                }
+                return Ok(());
+            }
+            "save_file" => {
+                // Send textDocument/didSave
+                let uri = lsp_server::server::path_to_uri(Path::new(&filepath));
+                for server in file_action.get_lsp_servers() {
+                    let flags = server.capability_flags.read().await;
+                    if flags.save_provider {
+                        let text = if flags.save_include_text {
+                            Some(std::fs::read_to_string(&filepath).unwrap_or_default())
+                        } else {
+                            None
+                        };
+                        let _ = server.send_did_save(&uri, text.as_deref());
+                    }
+                }
+                return Ok(());
+            }
+            "change_cursor" => {
+                // Just record cursor time for staleness checks
+                file_action.last_change_cursor_time.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                return Ok(());
+            }
+            "list_diagnostics" => {
+                // Not a handler — just show diagnostics
+                return Ok(());
+            }
+            _ => {} // Fall through to handler dispatch
+        }
+
         let handler = match self.handlers.get(method) {
             Some(h) => h,
             None => {

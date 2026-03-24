@@ -1380,6 +1380,7 @@ dependencies = [
  "epc",
  "handlers",
  "lsp-server",
+ "lsp-types",
  "remote",
  "search",
  "serde",
