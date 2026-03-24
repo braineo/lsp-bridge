@@ -11,9 +11,21 @@
 //! - `process_response`: process LSP response, call back to Emacs
 
 pub mod completion;
+pub mod completion_item;
 pub mod hover;
 pub mod find_define;
 pub mod code_action;
+pub mod formatting;
+pub mod rename;
+pub mod signature_help;
+pub mod inlay_hint;
+pub mod semantic_tokens;
+pub mod diagnostic;
+pub mod document_symbol;
+pub mod document_highlight;
+pub mod execute_command;
+pub mod workspace_symbol;
+pub mod call_hierarchy;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -225,12 +237,31 @@ impl Default for HandlerState {
 pub fn create_all_handlers() -> Vec<Box<dyn Handler>> {
     vec![
         Box::new(completion::Completion),
+        Box::new(completion_item::CompletionItem),
         Box::new(hover::Hover),
         Box::new(find_define::FindDefine),
         Box::new(find_define::FindTypeDefine),
         Box::new(find_define::FindImplementation),
         Box::new(find_define::FindReferences),
         Box::new(code_action::CodeAction),
+        Box::new(formatting::Formatting),
+        Box::new(formatting::RangeFormatting),
+        Box::new(rename::PrepareRename),
+        Box::new(rename::Rename),
+        Box::new(signature_help::SignatureHelp),
+        Box::new(inlay_hint::InlayHint),
+        Box::new(semantic_tokens::SemanticTokens),
+        Box::new(diagnostic::Diagnostic),
+        Box::new(document_symbol::DocumentSymbol),
+        Box::new(document_symbol::IMenu),
+        Box::new(document_symbol::Breadcrumb),
+        Box::new(document_highlight::DocumentHighlight),
+        Box::new(execute_command::ExecuteCommand),
+        Box::new(workspace_symbol::WorkspaceSymbol),
+        Box::new(call_hierarchy::PrepareCallHierarchyIncoming),
+        Box::new(call_hierarchy::PrepareCallHierarchyOutgoing),
+        Box::new(call_hierarchy::CallHierarchyIncoming),
+        Box::new(call_hierarchy::CallHierarchyOutgoing),
     ]
 }
 
@@ -318,25 +349,57 @@ mod tests {
     #[test]
     fn registry_has_all_handlers() {
         let registry = build_registry();
-        assert!(registry.contains_key("completion"));
-        assert!(registry.contains_key("hover"));
-        assert!(registry.contains_key("find_define"));
-        assert!(registry.contains_key("find_type_define"));
-        assert!(registry.contains_key("find_implementation"));
-        assert!(registry.contains_key("find_references"));
-        assert!(registry.contains_key("code_action"));
+        let expected = [
+            "completion", "completion_item_resolve", "hover",
+            "find_define", "find_type_define", "find_implementation", "find_references",
+            "code_action", "formatting", "rangeFormatting",
+            "prepare_rename", "rename", "signature_help",
+            "inlay_hint", "semantic_tokens", "diagnostic",
+            "document_symbol", "imenu", "breadcrumb",
+            "document_highlight", "execute_command", "workspace_symbol",
+            "prepare_call_hierarchy_incoming", "prepare_call_hierarchy_outgoing",
+            "call_hierarchy_incoming", "call_hierarchy_outgoing",
+        ];
+        for name in &expected {
+            assert!(registry.contains_key(name), "missing handler: {}", name);
+        }
+        assert_eq!(registry.len(), expected.len());
     }
 
     #[test]
     fn handler_methods_match_lsp_spec() {
         let registry = build_registry();
         // Per LSP 3.17 spec method names
-        assert_eq!(registry["completion"].method(), "textDocument/completion");
-        assert_eq!(registry["hover"].method(), "textDocument/hover");
-        assert_eq!(registry["find_define"].method(), "textDocument/definition");
-        assert_eq!(registry["find_type_define"].method(), "textDocument/typeDefinition");
-        assert_eq!(registry["find_implementation"].method(), "textDocument/implementation");
-        assert_eq!(registry["find_references"].method(), "textDocument/references");
-        assert_eq!(registry["code_action"].method(), "textDocument/codeAction");
+        let expected_methods = [
+            ("completion", "textDocument/completion"),
+            ("completion_item_resolve", "completionItem/resolve"),
+            ("hover", "textDocument/hover"),
+            ("find_define", "textDocument/definition"),
+            ("find_type_define", "textDocument/typeDefinition"),
+            ("find_implementation", "textDocument/implementation"),
+            ("find_references", "textDocument/references"),
+            ("code_action", "textDocument/codeAction"),
+            ("formatting", "textDocument/formatting"),
+            ("rangeFormatting", "textDocument/rangeFormatting"),
+            ("prepare_rename", "textDocument/prepareRename"),
+            ("rename", "textDocument/rename"),
+            ("signature_help", "textDocument/signatureHelp"),
+            ("inlay_hint", "textDocument/inlayHint"),
+            ("semantic_tokens", "textDocument/semanticTokens/full"),
+            ("diagnostic", "textDocument/diagnostic"),
+            ("document_symbol", "textDocument/documentSymbol"),
+            ("document_highlight", "textDocument/documentHighlight"),
+            ("execute_command", "workspace/executeCommand"),
+            ("workspace_symbol", "workspace/symbol"),
+            ("prepare_call_hierarchy_incoming", "textDocument/prepareCallHierarchy"),
+            ("call_hierarchy_incoming", "callHierarchy/incomingCalls"),
+            ("call_hierarchy_outgoing", "callHierarchy/outgoingCalls"),
+        ];
+        for (name, method) in &expected_methods {
+            assert_eq!(
+                registry[name].method(), *method,
+                "method mismatch for handler '{}'", name
+            );
+        }
     }
 }
