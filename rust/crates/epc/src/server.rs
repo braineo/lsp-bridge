@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -185,6 +185,43 @@ impl EpcConnection {
     /// Check if the connection is still alive.
     pub fn is_alive(&self) -> bool {
         !self.reader_handle.is_finished() && !self.writer_handle.is_finished()
+    }
+
+    /// Connect to a remote EPC server as a client.
+    ///
+    /// This is used to connect to Emacs's EPC server (the reverse direction).
+    /// Python equivalent: `EPCClient(("127.0.0.1", emacs_port))`
+    pub async fn connect(host: &str, port: u16) -> Result<Self> {
+        let addr = format!("{}:{}", host, port);
+        let stream = TcpStream::connect(&addr).await
+            .with_context(|| format!("failed to connect to EPC server at {}", addr))?;
+
+        tracing::info!("Connected to EPC server at {}", addr);
+
+        let (read_half, write_half) = stream.into_split();
+        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
+        let pending_returns: Arc<DashMap<u64, oneshot::Sender<SexpValue>>> =
+            Arc::new(DashMap::new());
+
+        let pending_returns_clone = pending_returns.clone();
+        let methods: Arc<DashMap<String, MethodHandler>> = Arc::new(DashMap::new());
+        let write_tx_clone = write_tx.clone();
+
+        let writer_handle = tokio::spawn(writer_loop(write_half, write_rx));
+        let reader_handle = tokio::spawn(reader_loop(
+            read_half,
+            methods,
+            pending_returns_clone,
+            write_tx_clone,
+        ));
+
+        Ok(Self {
+            write_tx,
+            pending_returns,
+            reader_handle,
+            writer_handle,
+            uid_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        })
     }
 }
 

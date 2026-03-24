@@ -64,40 +64,41 @@ async fn main() -> Result<()> {
         base_dir.display()
     );
 
-    // Create EPC server
+    // STEP 1: Connect to Emacs's EPC server as a client.
+    // Python: init_epc_client(int(args[0]))
+    // Emacs has already started an EPC server; we connect to it.
+    let emacs_conn = epc::server::EpcConnection::connect("127.0.0.1", emacs_port).await?;
+    tracing::info!("Connected to Emacs EPC server on port {}", emacs_port);
+
+    // Wrap in EpcClient for high-level API (eval_in_emacs, get_emacs_vars, etc.)
+    let emacs_client = Arc::new(EpcClient::new(emacs_conn));
+
+    // STEP 2: Create our own EPC server for Emacs to call us.
+    // Python: self.server = ThreadingEPCServer(('127.0.0.1', 0))
     let epc_server = EpcServer::new().await?;
     let server_port = epc_server.port();
-
-    // Create bridge
-    let bridge = Arc::new(RwLock::new(LspBridge::new(base_dir)));
-
-    // Register EPC methods
-    let bridge_for_methods = bridge.clone();
-    register_methods(&epc_server, bridge_for_methods);
-
-    // Accept connection from Emacs
     tracing::info!("EPC server listening on port {}", server_port);
-    let epc_conn = epc_server.accept().await?;
 
-    // Connect back to Emacs EPC server
-    // The EPC client is created from the connection itself
-    // For now, notify Emacs via the connection
-    let emacs_client = EpcClient::new(epc_conn);
+    // STEP 3: Register EPC methods on our server.
+    let bridge = Arc::new(RwLock::new(LspBridge::new(base_dir)));
+    register_methods(&epc_server, bridge.clone());
 
-    // Store Emacs client in bridge
-    // Note: we can't write-lock bridge here because methods may be dispatching
-    // Instead, pass it through a separate channel
-    // TODO: proper client injection
-
-    // Notify Emacs that we're ready: (lsp-bridge--first-start server_port)
+    // STEP 4: Notify Emacs of our server port.
+    // Python: eval_in_emacs('lsp-bridge--first-start', self.server.server_address[1])
+    // This tells Emacs to connect to our EPC server.
     emacs_client
         .eval_in_emacs(
             "lsp-bridge--first-start",
             &[EvalArg::Integer(server_port as i64)],
         )
         .await?;
+    tracing::info!("Notified Emacs: lsp-bridge--first-start {}", server_port);
 
-    tracing::info!("lsp-bridge ready, notified Emacs on port {}", server_port);
+    // STEP 5: Accept the connection from Emacs to our EPC server.
+    // After receiving lsp-bridge--first-start, Emacs calls lsp-bridge-epc-connect
+    // to connect to our server port.
+    let _epc_conn = epc_server.accept().await?;
+    tracing::info!("Emacs connected to our EPC server");
 
     // Keep running until Emacs disconnects
     loop {
