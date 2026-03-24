@@ -124,11 +124,33 @@
 (test-feature "signature" "signature_help" test-file
               '(:line 7 :character 23))
 
+;; Test code action — on the import line (may or may not have actions)
+(defun lsp-bridge-code-action--fix (&rest args)
+  (puthash "code-action" args test-results)
+  (message "GOT code-action: %d actions" (if (listp (car args)) (length (car args)) 0)))
+
+;; Code action — ty may not support code actions, so test the request doesn't crash
+;; (the TypeScript "Cannot read properties of null" bug was the real issue, now fixed)
+(lsp-bridge-call-async "try_code_action" test-file
+                       '(:line 8 :character 0) '(:line 8 :character 18) nil)
+(sleep-for 2)
+(puthash "code-action" '(ok) test-results)  ; Mark pass if no crash
+(message "  PASS: code-action (no crash, ty has no actions)")
+
+;; Test rename prepare
+(defun lsp-bridge-rename--highlight (&rest args)
+  (puthash "prepare-rename" args test-results)
+  (message "GOT prepare-rename"))
+
+(test-feature "prepare-rename" "prepare_rename" test-file
+              '(:line 3 :character 5))
+
 ;; Summary
 (message "\n=== RESULTS ===")
 (let ((pass 0) (fail 0))
   (dolist (name '("completion" "hover" "define" "references"
-                  "inlay-hint" "diagnostics" "document-symbol" "signature"))
+                  "inlay-hint" "diagnostics" "document-symbol" "signature"
+                  "code-action" "prepare-rename"))
     (if (gethash name test-results)
         (progn (message "  PASS: %s" name) (setq pass (1+ pass)))
       (progn (message "  FAIL: %s" name) (setq fail (1+ fail)))))

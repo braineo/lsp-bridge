@@ -609,6 +609,48 @@ impl LspBridge {
             "list_diagnostics" => {
                 return Ok(());
             }
+            "try_formatting" => {
+                // Python: try_formatting(start, end, *args)
+                // If start == end → formatting(tab_size)
+                // Else → rangeFormatting(start, end, tab_size)
+                let start = json_args.get(1).cloned().unwrap_or(Value::Null);
+                let end = json_args.get(2).cloned().unwrap_or(Value::Null);
+                let tab_size = json_args.get(3).cloned().unwrap_or(json!(4));
+
+                for server in file_action.get_lsp_servers() {
+                    let flags = server.capability_flags.read().await;
+                    let uri = lsp_server::server::path_to_uri(Path::new(&filepath));
+
+                    let (lsp_method, params) = if start == end {
+                        if !flags.code_format_provider { continue; }
+                        ("textDocument/formatting", json!({
+                            "textDocument": {"uri": uri},
+                            "options": {"tabSize": tab_size, "insertSpaces": true,
+                                "trimTrailingWhitespace": true, "insertFinalNewline": false, "trimFinalNewlines": true}
+                        }))
+                    } else {
+                        if !flags.range_format_provider { continue; }
+                        ("textDocument/rangeFormatting", json!({
+                            "textDocument": {"uri": uri},
+                            "range": {"start": start, "end": end},
+                            "options": {"tabSize": tab_size, "insertSpaces": true,
+                                "trimTrailingWhitespace": true, "insertFinalNewline": false, "trimFinalNewlines": true}
+                        }))
+                    };
+
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        server.send_request(lsp_method, params),
+                    ).await {
+                        Ok(Ok(resp)) if !resp.is_null() && resp.as_array().is_some_and(|a| !a.is_empty()) => {
+                            self.eval_in_emacs_method("lsp-bridge-format--update",
+                                vec![Value::String(filepath.clone()), resp]).await;
+                        }
+                        _ => {}
+                    }
+                }
+                return Ok(());
+            }
             "try_code_action" | "code_action" => {
                 // Python: try_code_action(range_start, range_end, action_kind)
                 // Preprocesses: adds server_name and diagnostics before calling handler
