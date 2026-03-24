@@ -287,15 +287,41 @@ impl LspBridge {
         enable_diagnostics: bool,
     ) -> Result<Arc<LspServer>> {
         let config_json = serde_json::to_value(config)?;
+        let server_name = config.name.clone();
 
+        // Route LSP notifications (especially diagnostics) to Emacs
+        let emacs_for_notif = self.emacs.clone();
         let on_notification: Arc<lsp_server::server::NotificationCallback> =
-            Arc::new(Box::new(|method, params| {
-                tracing::debug!("LSP notification: {}", method);
-                // TODO: route diagnostics to file actions
+            Arc::new(Box::new(move |method, params| {
+                if method == "textDocument/publishDiagnostics" {
+                    // Forward diagnostics to Emacs
+                    if let Some(emacs) = &emacs_for_notif {
+                        let emacs = emacs.clone();
+                        let server_name = server_name.clone();
+                        let uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                        let filepath = lsp_server::server::uri_to_path(&uri);
+                        let diagnostics = params.get("diagnostics").cloned().unwrap_or(json!([]));
+                        let diag_count = diagnostics.as_array().map(|a| a.len()).unwrap_or(0);
+
+                        tokio::spawn(async move {
+                            let args = vec![
+                                epc::types::EvalArg::String(filepath),
+                                epc::types::EvalArg::String(String::new()), // host
+                                epc::types::EvalArg::Raw(SexpValue::from_json(&diagnostics)),
+                                epc::types::EvalArg::Integer(diag_count as i64),
+                            ];
+                            if let Err(e) = emacs.eval_in_emacs("lsp-bridge-diagnostic--render", &args).await {
+                                tracing::error!("Failed to send diagnostics to Emacs: {}", e);
+                            }
+                        });
+                    }
+                } else {
+                    tracing::debug!("LSP notification: {}", method);
+                }
             }));
 
         let on_server_request: Arc<lsp_server::server::ServerRequestCallback> =
-            Arc::new(Box::new(|id, method, params| {
+            Arc::new(Box::new(|id, method, _params| {
                 tracing::debug!("LSP server request: {} (id={})", method, id);
             }));
 

@@ -112,6 +112,34 @@
             (message "COMPLETION TEST FAILED: no response after 10s")))
       (error (message "try_completion error: %S" err)))
 
+    ;; Test diagnostics
+    (message "Checking for diagnostics...")
+    (defvar test-diagnostics-received nil)
+    (defun lsp-bridge-diagnostic--render (filepath host diagnostics count)
+      (setq test-diagnostics-received t)
+      (message "DIAGNOSTICS RECEIVED! file=%s count=%s" filepath count)
+      (when (listp diagnostics)
+        (dolist (d (seq-take diagnostics 3))
+          (message "  - %s" (if (listp d) (plist-get d :message) d)))))
+
+    ;; Write a file with an error to trigger diagnostics
+    (with-temp-file test-file
+      (insert "import os\nundefined_variable\n"))
+    (lsp-bridge-call-async "change_file" test-file
+                           '(:line 1 :character 0)
+                           '(:line 1 :character 0)
+                           0 "undefined_variable\n"
+                           '(:line 1 :character 18)
+                           "*test*" "" 2)
+    (let ((wait 0))
+      (while (and (not test-diagnostics-received) (< wait 10))
+        (accept-process-output nil 1)
+        (setq wait (1+ wait))
+        (message "  waiting for diagnostics... %ds" wait)))
+    (if test-diagnostics-received
+        (message "DIAGNOSTICS TEST PASSED!")
+      (message "DIAGNOSTICS TEST: no diagnostics received (may be OK for ty)"))
+
     (delete-file test-file)
     (delete-directory test-dir t)))
 

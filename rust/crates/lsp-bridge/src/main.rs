@@ -84,8 +84,49 @@ async fn main() -> Result<()> {
     bridge_inner.set_emacs(emacs_client.clone());
     let bridge = Arc::new(RwLock::new(bridge_inner));
 
-    // STEP 4: Register EPC methods on our server.
-    register_methods(&epc_server, bridge.clone());
+    // STEP 4: Create serial event queue (matches Python's event_dispatcher).
+    // All file action methods go through this channel to prevent concurrent
+    // operations on the same workspace (e.g., spawning duplicate LSP servers).
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<EventMessage>(256);
+
+    // Event dispatcher task — processes events sequentially.
+    // This is the Rust equivalent of Python's event_dispatcher thread.
+    // All file operations are serialized here to prevent race conditions.
+    let bridge_for_events = bridge.clone();
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            let bridge = bridge_for_events.read().await;
+            match event.method.as_str() {
+                "open_file" => {
+                    let filepath = event.args.first()
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if let Err(e) = bridge.open_file(&filepath).await {
+                        tracing::error!("open_file error: {}", e);
+                    }
+                }
+                "close_file" => {
+                    let filepath = event.args.first()
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if let Err(e) = bridge.close_file(&filepath).await {
+                        tracing::error!("close_file error: {}", e);
+                    }
+                }
+                method => {
+                    if let Err(e) = bridge.dispatch(method, event.args).await {
+                        tracing::error!("event dispatch '{}' error: {}", method, e);
+                    }
+                }
+            }
+        }
+        tracing::info!("Event dispatcher exited");
+    });
+
+    // STEP 5: Register EPC methods on our server.
+    register_methods(&epc_server, bridge.clone(), event_tx.clone());
 
     // STEP 5: Notify Emacs of our server port.
     // Python: eval_in_emacs('lsp-bridge--first-start', self.server.server_address[1])
@@ -135,156 +176,86 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// An event message for the serial event queue.
+struct EventMessage {
+    method: String,
+    args: Vec<SexpValue>,
+}
+
 /// Register all EPC methods on the server.
 ///
-/// Mirrors Python's register_instance(self) + build_file_action_function.
-fn register_methods(server: &EpcServer, bridge: Arc<RwLock<LspBridge>>) {
-    // open_file(filepath)
-    let b = bridge.clone();
-    server.register("open_file", move |args| {
-        let b = b.clone();
-        async move {
-            let filepath = args
-                .first()
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .to_string();
-            let bridge = b.read().await;
-            match bridge.open_file(&filepath).await {
-                Ok(true) => Ok(SexpValue::Bool(true)),
-                Ok(false) => Ok(SexpValue::Nil),
-                Err(e) => {
-                    tracing::error!("open_file error: {}", e);
-                    Ok(SexpValue::Nil)
-                }
-            }
-        }
-    });
+/// File action methods go through the event queue (serialized, like Python's
+/// event_dispatcher). Other methods run directly.
+fn register_methods(
+    server: &EpcServer,
+    bridge: Arc<RwLock<LspBridge>>,
+    event_tx: tokio::sync::mpsc::Sender<EventMessage>,
+) {
+    // File action methods — all go through the serial event queue.
+    // This matches Python's event_dispatcher pattern: prevents concurrent
+    // operations from spawning duplicate LSP servers for the same workspace.
 
-    // close_file(filepath)
-    let b = bridge.clone();
-    server.register("close_file", move |args| {
-        let b = b.clone();
-        async move {
-            let filepath = args
-                .first()
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .to_string();
-            let bridge = b.read().await;
-            if let Err(e) = bridge.close_file(&filepath).await {
-                tracing::error!("close_file error: {}", e);
-            }
-            Ok(SexpValue::Nil)
-        }
-    });
-
-    // Register all handler methods (completion, hover, find_define, etc.)
-    // These follow the build_file_action_function pattern from Python:
-    // method(filepath, ...args) → dispatch to handler
-    let handler_names: Vec<&'static str> = {
+    // Methods that go through the event queue (serialized):
+    let file_action_methods: Vec<&str> = {
         let bridge = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(bridge.read())
         });
-        bridge.handlers.keys().copied().collect()
+        let mut methods: Vec<&str> = bridge.handlers.keys().copied().collect();
+        methods.extend(&[
+            "change_file", "update_file", "save_file",
+            "try_completion", "try_formatting", "change_cursor",
+            "list_diagnostics", "try_code_action", "workspace_symbol",
+        ]);
+        methods
     };
 
-    for handler_name in handler_names {
-        let b = bridge.clone();
-        let name = handler_name.to_string();
-        server.register(handler_name, move |args| {
-            let b = b.clone();
-            let name = name.clone();
+    for method_name in file_action_methods {
+        let tx = event_tx.clone();
+        // Map Emacs method names to handler names
+        let handler_name = match method_name {
+            "try_completion" => "completion",
+            "try_code_action" => "code_action",
+            other => other,
+        };
+        let handler_name = handler_name.to_string();
+
+        server.register(method_name, move |args| {
+            let tx = tx.clone();
+            let handler_name = handler_name.clone();
             async move {
-                let bridge = b.read().await;
-                match bridge.dispatch(&name, args).await {
-                    Ok(result) => Ok(result),
-                    Err(e) => {
-                        tracing::error!("handler '{}' error: {}", name, e);
-                        Ok(SexpValue::Nil)
-                    }
-                }
+                // Push to event queue — processed sequentially
+                let _ = tx.send(EventMessage {
+                    method: handler_name,
+                    args,
+                }).await;
+                Ok(SexpValue::Nil)
             }
         });
     }
 
-    // Additional methods matching Python's explicit registrations
-
-    // change_file — file content changed
-    let b = bridge.clone();
-    server.register("change_file", move |args| {
-        let b = b.clone();
-        async move {
-            let bridge = b.read().await;
-            match bridge.dispatch("change_file", args).await {
-                Ok(r) => Ok(r),
-                Err(e) => {
-                    tracing::error!("change_file error: {}", e);
-                    Ok(SexpValue::Nil)
-                }
-            }
-        }
-    });
-
-    // save_file
-    let b = bridge.clone();
-    server.register("save_file", move |args| {
-        let b = b.clone();
-        async move {
-            let bridge = b.read().await;
-            match bridge.dispatch("save_file", args).await {
-                Ok(r) => Ok(r),
-                Err(e) => {
-                    tracing::error!("save_file error: {}", e);
-                    Ok(SexpValue::Nil)
-                }
-            }
-        }
-    });
-
-    // try_completion
-    let b = bridge.clone();
-    server.register("try_completion", move |args| {
-        let b = b.clone();
-        async move {
-            let bridge = b.read().await;
-            match bridge.dispatch("completion", args).await {
-                Ok(r) => Ok(r),
-                Err(e) => {
-                    tracing::error!("try_completion error: {}", e);
-                    Ok(SexpValue::Nil)
-                }
-            }
-        }
-    });
-
-    // try_code_action
-    let b = bridge.clone();
-    server.register("try_code_action", move |args| {
-        let b = b.clone();
-        async move {
-            let bridge = b.read().await;
-            match bridge.dispatch("code_action", args).await {
-                Ok(r) => Ok(r),
-                Err(e) => {
-                    tracing::error!("try_code_action error: {}", e);
-                    Ok(SexpValue::Nil)
-                }
-            }
-        }
-    });
-
-    // update_file, try_formatting, change_cursor, list_diagnostics, workspace_symbol
-    for method in &["update_file", "try_formatting", "change_cursor", "list_diagnostics", "workspace_symbol"] {
-        let b = bridge.clone();
-        let name = method.to_string();
-        server.register(*method, move |args| {
-            let b = b.clone();
-            let name = name.clone();
+    // open_file and close_file also go through the event queue
+    {
+        let tx = event_tx.clone();
+        server.register("open_file", move |args| {
+            let tx = tx.clone();
             async move {
-                tracing::debug!("EPC method called: {}", name);
-                let bridge = b.read().await;
-                let _ = bridge.dispatch(&name, args).await;
+                let _ = tx.send(EventMessage {
+                    method: "open_file".to_string(),
+                    args,
+                }).await;
+                Ok(SexpValue::Nil)
+            }
+        });
+    }
+    {
+        let tx = event_tx.clone();
+        server.register("close_file", move |args| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(EventMessage {
+                    method: "close_file".to_string(),
+                    args,
+                }).await;
                 Ok(SexpValue::Nil)
             }
         });
