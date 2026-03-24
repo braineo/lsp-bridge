@@ -176,4 +176,43 @@ mod tests {
         let results = sl.search("test", "prefix");
         assert_eq!(results[0], "prefix");
     }
+
+    // ===== Python ground truth tests =====
+    // Generated via: uv run python3 with core/search_list.py logic
+
+    #[test]
+    fn python_fuzzy_regex_pattern() {
+        // Python: re.sub(r'([a-zA-Z0-9-_])', r'\1.*', re.escape("bs")) → "b.*s.*"
+        // "buffer-string" matches b.*s.* → True
+        // "buffer-size" matches b.*s.* → True
+        // "abc" does NOT match b.*s.* → False
+        // "basic" matches b.*s.* → True
+        let sl = SearchList::new();
+        sl.update(
+            "t",
+            vec![
+                "buffer-string".to_string(),
+                "buffer-size".to_string(),
+                "abc".to_string(),
+                "basic".to_string(),
+            ],
+            100,
+        );
+        let results = sl.search("t", "bs");
+        assert!(results.contains(&"buffer-string".to_string()));
+        assert!(results.contains(&"buffer-size".to_string()));
+        assert!(!results.contains(&"abc".to_string()));
+        assert!(results.contains(&"basic".to_string()));
+    }
+
+    #[test]
+    fn python_dash_removal_match() {
+        // Python: symbol.replace("-", "").startswith(prefix)
+        // "my-func".replace("-","") = "myfunc".startswith("myfunc") → True
+        let sl = SearchList::new();
+        sl.update("t", vec!["my-func".to_string(), "other".to_string()], 100);
+        let results = sl.search("t", "myfunc");
+        assert!(results.contains(&"my-func".to_string()));
+        assert!(!results.contains(&"other".to_string()));
+    }
 }

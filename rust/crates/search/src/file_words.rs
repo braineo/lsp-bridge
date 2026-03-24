@@ -314,4 +314,62 @@ mod tests {
             assert_eq!(c["annotation"], "Search Word");
         }
     }
+
+    // ===== Python ground truth tests =====
+    // Generated via: uv run python3 with core/search_file_words.py logic
+
+    #[test]
+    fn python_extract_words_code() {
+        // Python: re.findall(r"[\w|-]+", content) then filter len>3, not numeric
+        // Input: "def my_function(arg1, arg2):\n    return value + 123"
+        // Raw: ['123', 'arg1', 'arg2', 'def', 'my_function', 'return', 'value']
+        // Filtered (len>3, not numeric): ['arg1', 'arg2', 'my_function', 'return', 'value']
+        let words = extract_words("def my_function(arg1, arg2):\n    return value + 123");
+        assert!(words.contains("my_function"));
+        assert!(words.contains("return"));
+        assert!(words.contains("value"));
+        assert!(words.contains("arg1"));
+        assert!(words.contains("arg2"));
+        assert!(!words.contains("def")); // len == 3
+        assert!(!words.contains("123")); // numeric
+    }
+
+    #[test]
+    fn python_extract_words_hyphens() {
+        // Python filtered: ['my-variable', 'short', 'some-long-name']
+        let words = extract_words("my-variable some-long-name x short");
+        assert!(words.contains("my-variable"));
+        assert!(words.contains("some-long-name"));
+        assert!(words.contains("short"));
+        assert!(!words.contains("x")); // len == 1
+    }
+
+    #[test]
+    fn python_prefix_match() {
+        // Python: prefix="hel", words={'hello','helicopter','help','something','world'}
+        // Result: ['helicopter', 'hello', 'help']
+        let sfw = SearchFileWords::new(100, false, 0.0);
+        sfw.index_file("t.py", "hello helicopter help something world");
+        let results = sfw.search("hel");
+        let labels: Vec<&str> = results.iter().filter_map(|r| r["label"].as_str()).collect();
+        assert!(labels.contains(&"hello"));
+        assert!(labels.contains(&"helicopter"));
+        // "help" is len 4, starts with "hel" → should match
+        assert!(labels.contains(&"help"));
+        assert!(!labels.contains(&"something"));
+        assert!(!labels.contains(&"world"));
+    }
+
+    #[test]
+    fn python_upper_case_prefix() {
+        // Python: prefix="HEL", isupper()=True → returns uppercased words
+        // Result: ['HELICOPTER', 'HELLO', 'HELP']
+        let sfw = SearchFileWords::new(100, false, 0.0);
+        sfw.index_file("t.py", "hello helicopter help something world");
+        let results = sfw.search("HEL");
+        let labels: Vec<&str> = results.iter().filter_map(|r| r["label"].as_str()).collect();
+        assert!(labels.contains(&"HELLO"));
+        assert!(labels.contains(&"HELICOPTER"));
+        assert!(labels.contains(&"HELP"));
+    }
 }
