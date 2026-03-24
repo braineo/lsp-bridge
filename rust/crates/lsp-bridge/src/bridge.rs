@@ -144,35 +144,72 @@ impl LspBridge {
             find_project_path(filepath_path)
         };
 
-        // Ask Emacs which single-lang-server to use
-        let server_name = if let Some(emacs) = &self.emacs {
+        // Ask Emacs for the server config — try multi-server first, then single.
+        // This mirrors Python's open_file() which checks get-multi-lang-server first.
+        let mut multi_server_name = None;
+        let mut single_server_name = None;
+
+        if let Some(emacs) = &self.emacs {
+            // Try multi-lang-server first
             match emacs.get_emacs_func_result(
-                "get-single-lang-server",
+                "get-multi-lang-server",
                 vec![
                     SexpValue::String(project_path.to_string_lossy().to_string()),
                     SexpValue::String(filepath.to_string()),
                 ],
             ).await {
-                Ok(SexpValue::String(name)) => Some(name),
-                _ => None,
+                Ok(SexpValue::String(name)) if !name.is_empty() => {
+                    multi_server_name = Some(name);
+                }
+                _ => {}
+            }
+
+            // Try single-lang-server
+            if multi_server_name.is_none() {
+                match emacs.get_emacs_func_result(
+                    "get-single-lang-server",
+                    vec![
+                        SexpValue::String(project_path.to_string_lossy().to_string()),
+                        SexpValue::String(filepath.to_string()),
+                    ],
+                ).await {
+                    Ok(SexpValue::String(name)) if !name.is_empty() => {
+                        single_server_name = Some(name);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // For multi-server: load the multi-server config and use its "default" server.
+        // If multi-server config fails, fall through to single-server.
+        let server_name = if let Some(multi_name) = &multi_server_name {
+            let multi_path = self.multiserver_dir.join(format!("{}.json", multi_name));
+            if let Ok(multi_config) = config::load_multi_server_config(&multi_path) {
+                tracing::info!("Multi-server config '{}', using default: {}", multi_name, multi_config.default);
+                Some(multi_config.default)
+            } else {
+                tracing::debug!("No multi-server config file for '{}', trying single-server", multi_name);
+                None
             }
         } else {
             None
         };
 
+        // Fall through to single-server if multi didn't resolve
+        let server_name = server_name
+            .or(single_server_name)
+            .or_else(|| {
+                // Last resort: extension-based lookup
+                let ext = filepath_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                self.find_server_config_by_extension(ext).map(|c| c.name.clone())
+            });
+
         let server_name = match server_name {
             Some(name) => name,
             None => {
-                tracing::warn!("Emacs returned no server for: {}", filepath);
-                // Fallback: try to find by extension
-                let ext = filepath_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                match self.find_server_config_by_extension(ext) {
-                    Some(c) => c.name.clone(),
-                    None => {
-                        tracing::warn!("No LSP server found for: {}", filepath);
-                        return Ok(false);
-                    }
-                }
+                tracing::warn!("No LSP server found for: {}", filepath);
+                return Ok(false);
             }
         };
 
@@ -220,15 +257,13 @@ impl LspBridge {
             server
         };
 
-        // Send didOpen
+        // Determine language ID — mirrors Python's get_language_id().
+        // Priority: 1) Ask Emacs  2) languageIds map  3) config.languageId  4) extension
+        let ext = filepath_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let language_id = self.get_language_id(filepath, &config, &ext).await;
+        tracing::info!("didOpen {} as languageId={}", filepath, language_id);
+
         let uri = lsp_server::server::path_to_uri(filepath_path);
-        let language_id = if !config.language_id.is_empty() {
-            config.language_id.clone()
-        } else {
-            // Try languageIds map
-            let ext = filepath_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            config.language_ids.get(ext).cloned().unwrap_or_else(|| ext.to_string())
-        };
         let text = std::fs::read_to_string(filepath).unwrap_or_default();
         lsp_server.send_did_open(&uri, &language_id, 0, &text)?;
 
@@ -239,6 +274,47 @@ impl LspBridge {
         self.file_actions.insert(filepath.to_string(), Arc::new(file_action));
 
         Ok(true)
+    }
+
+    /// Determine the language ID for a file.
+    ///
+    /// Mirrors Python's LspServer.get_language_id():
+    /// 1. Ask Emacs via get-language-id (user can customize)
+    /// 2. Check config's languageIds map (extension → language ID)
+    /// 3. Use config's languageId field
+    /// 4. Fallback to file extension
+    async fn get_language_id(&self, filepath: &str, config: &ServerConfig, ext: &str) -> String {
+        // 1. Ask Emacs
+        if let Some(emacs) = &self.emacs {
+            let server_name = config.name.split('#').last().unwrap_or(&config.name);
+            let project_path = find_project_path(Path::new(filepath));
+            if let Ok(SexpValue::String(lang_id)) = emacs.get_emacs_func_result(
+                "get-language-id",
+                vec![
+                    SexpValue::String(project_path.to_string_lossy().to_string()),
+                    SexpValue::String(filepath.to_string()),
+                    SexpValue::String(server_name.to_string()),
+                    SexpValue::String(ext.to_string()),
+                ],
+            ).await {
+                if !lang_id.is_empty() {
+                    return lang_id;
+                }
+            }
+        }
+
+        // 2. Check languageIds map (e.g., {"tsx": "typescriptreact"})
+        if let Some(lang_id) = config.language_ids.get(ext) {
+            return lang_id.clone();
+        }
+
+        // 3. Use config's languageId field
+        if !config.language_id.is_empty() {
+            return config.language_id.clone();
+        }
+
+        // 4. Fallback to extension
+        ext.to_string()
     }
 
     /// Close a file.

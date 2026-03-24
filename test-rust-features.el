@@ -8,8 +8,11 @@
 
 (require 'lsp-bridge)
 (setq lsp-bridge-use-rust-backend t)
+;; Override to use ty for Python, disable multi-server for test
 (setq lsp-bridge-single-lang-server-mode-list
       '(((python-mode python-ts-mode) . "ty")))
+(setq lsp-bridge-multi-lang-server-mode-list nil)
+(setq lsp-bridge-multi-lang-server-extension-list nil)
 
 ;; Start backend
 (lsp-bridge--start-epc-server)
