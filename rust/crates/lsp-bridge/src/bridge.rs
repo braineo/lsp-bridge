@@ -839,9 +839,33 @@ impl LspBridge {
                 }
                 return Ok(());
             }
+            "rename_file" => {
+                // Python: FileAction.rename_file(old_filepath, new_filepath)
+                // Args: [old_filepath, new_filepath]
+                let old_path = json_args.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                let new_path = json_args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(server) = file_action.get_lsp_servers().first() {
+                    let _ = server.send_notification("workspace/didRenameFiles", json!({
+                        "files": [{"oldUri": lsp_server::server::path_to_uri(Path::new(old_path)),
+                                   "newUri": lsp_server::server::path_to_uri(Path::new(new_path))}]
+                    }));
+                }
+                return Ok(());
+            }
+            "fetch_completion_item_info" => {
+                // Python: fetch_completion_item_info(filepath, item_key, server_name)
+                // NOT dispatched through FileAction — called directly on LspBridge
+                // For now, just log — full completion_item_resolve needs stored items
+                let item_key = json_args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                let server_name = json_args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+                tracing::debug!("fetch_completion_item_info: key={} server={}", item_key, server_name);
+                // TODO: implement completion item resolve with stored items
+                return Ok(());
+            }
             _ => {} // Fall through to handler dispatch
         }
 
+        // Generic handler dispatch — mirrors Python's FileAction.call() → send_request()
         let handler = match self.handlers.get(method) {
             Some(h) => h,
             None => {
@@ -857,6 +881,25 @@ impl LspBridge {
 
         for server in &servers {
             let flags = server.capability_flags.read().await;
+
+            // Provider capability check — mirrors Python's send_request()
+            // Python: if hasattr(handler, "provider"), check getattr(server, handler.provider)
+            // We check known provider mappings here
+            let skip = match method {
+                "formatting" | "rangeFormatting" => !flags.code_format_provider && !flags.range_format_provider,
+                "signature_help" => !flags.signature_help_provider,
+                "document_highlight" => !flags.document_highlight_provider,
+                "inlay_hint" => !flags.inlay_hint_provider,
+                "semantic_tokens" => !flags.semantic_tokens_provider,
+                "workspace_symbol" => !flags.workspace_symbol_provider,
+                "prepare_rename" => !flags.rename_prepare_provider,
+                "diagnostic" => !flags.diagnostic_provider,
+                _ => false, // No provider check for other handlers
+            };
+            if skip {
+                tracing::debug!("handler '{}': server '{}' doesn't support this, skipping", method, server.server_name);
+                continue;
+            }
 
             let request_ctx = RequestContext {
                 args: json_args[1..].to_vec(),
@@ -884,7 +927,6 @@ impl LspBridge {
                 params
             };
 
-            // Send request with timeout to avoid hanging forever
             let response = match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 server.send_request(handler.method(), params),
@@ -900,16 +942,11 @@ impl LspBridge {
                 }
             };
 
-            // Check for LSP error response
             if response.get("error").is_some() {
                 tracing::warn!("handler '{}' LSP error: {}", method,
                     response["error"].get("message").and_then(|m| m.as_str()).unwrap_or("unknown"));
                 continue;
             }
-
-            tracing::debug!("handler '{}' got response ({} bytes)",
-                method,
-                serde_json::to_string(&response).map(|s| s.len()).unwrap_or(0));
 
             let server_names = file_action.get_server_names();
             let response_ctx = ResponseContext {
