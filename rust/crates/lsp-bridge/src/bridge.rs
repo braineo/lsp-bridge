@@ -75,6 +75,60 @@ impl FileAction {
             .map(|s| s.server_name.clone())
             .collect()
     }
+
+    /// Get the servers that should handle a specific method.
+    ///
+    /// Mirrors Python's FileAction.get_method_server_names + call routing.
+    /// For single-server: always returns the single server.
+    /// For multi-server: looks up the method in multi_servers_info config.
+    pub fn get_servers_for_method(&self, method: &str) -> Vec<Arc<LspServer>> {
+        if let Some(ref server) = self.single_server {
+            return vec![server.clone()];
+        }
+
+        let (multi_info, multi_servers) = match (&self.multi_servers_info, &self.multi_servers) {
+            (Some(info), Some(servers)) => (info, servers),
+            _ => return vec![],
+        };
+
+        let default_name = &multi_info.default;
+
+        // Which server names handle this method?
+        let server_names: Vec<String> = match method {
+            // These methods can go to multiple servers
+            "completion" | "completion_item_resolve" | "diagnostics" | "code_action" => {
+                let target = match method {
+                    "completion" | "completion_item_resolve" => &multi_info.completion,
+                    "diagnostics" => &multi_info.diagnostics,
+                    "code_action" => &multi_info.code_action,
+                    _ => unreachable!(),
+                };
+                match target {
+                    Some(t) => t.names().iter().map(|s| s.to_string()).collect(),
+                    None => vec![default_name.clone()],
+                }
+            }
+            // These methods go to a specific server or default
+            "formatting" => {
+                match &multi_info.formatting {
+                    Some(t) => t.names().iter().map(|s| s.to_string()).collect(),
+                    None => vec![default_name.clone()],
+                }
+            }
+            "execute_command" => {
+                match &multi_info.execute_command {
+                    Some(t) => t.names().iter().map(|s| s.to_string()).collect(),
+                    None => vec![default_name.clone()],
+                }
+            }
+            // All other methods → default server only
+            _ => vec![default_name.clone()],
+        };
+
+        server_names.iter()
+            .filter_map(|name| multi_servers.get(name).cloned())
+            .collect()
+    }
 }
 
 /// The main LspBridge orchestrator.
@@ -670,7 +724,7 @@ impl LspBridge {
                 let end = json_args.get(2).cloned().unwrap_or(Value::Null);
                 let tab_size = json_args.get(3).cloned().unwrap_or(json!(4));
 
-                for server in file_action.get_lsp_servers() {
+                for server in file_action.get_servers_for_method("formatting") {
                     let flags = server.capability_flags.read().await;
                     let uri = lsp_server::server::path_to_uri(Path::new(&filepath));
 
@@ -711,7 +765,7 @@ impl LspBridge {
                 let range_end = json_args.get(2).cloned().unwrap_or(Value::Null);
                 let action_kind = json_args.get(3).cloned().unwrap_or(Value::Null);
 
-                for server in file_action.get_lsp_servers() {
+                for server in file_action.get_servers_for_method("code_action") {
                     let flags = server.capability_flags.read().await;
                     if !flags.code_action_provider { continue; }
 
@@ -753,7 +807,7 @@ impl LspBridge {
                 let before_char = json_args.get(2).and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let prefix = json_args.get(3).and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-                for server in file_action.get_lsp_servers() {
+                for server in file_action.get_servers_for_method("completion") {
                     let flags = server.capability_flags.read().await;
                     let uri = lsp_server::server::path_to_uri(Path::new(&filepath));
 
@@ -796,7 +850,7 @@ impl LspBridge {
             }
         };
 
-        let servers = file_action.get_lsp_servers();
+        let servers = file_action.get_servers_for_method(method);
         if servers.is_empty() {
             return Ok(());
         }
