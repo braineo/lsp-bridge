@@ -394,6 +394,19 @@ LSP-Bridge will enable completion inside string literals."
                                                                      (file-name-directory load-file-name)
                                                                    default-directory)))
 
+(defvar lsp-bridge-rust-binary
+  (let ((dir (if load-file-name
+                 (file-name-directory load-file-name)
+               default-directory)))
+    (expand-file-name "rust/target/release/lsp-bridge" dir))
+  "Path to the Rust backend binary for lsp-bridge.")
+
+(defcustom lsp-bridge-use-rust-backend nil
+  "When non-nil, use the Rust backend instead of Python.
+The Rust binary must be built first with `cargo build --release`
+in the rust/ directory."
+  :type 'boolean)
+
 (defvar-local lsp-bridge-mark-ring nil
   "The list of saved lsp-bridge marks, most recent first.")
 
@@ -1385,33 +1398,42 @@ So we build this macro to restore postion after code format."
       (remove-hook 'post-command-hook #'lsp-bridge-start-process)
     ;; start epc server and set `lsp-bridge-server-port'
     (lsp-bridge--start-epc-server)
-    (let* ((lsp-bridge-args (append
-                             (when (member lsp-bridge-python-command '("pipx" "uv"))
-                               (list "run"))
-                             (list lsp-bridge-python-file)
-                             (list (number-to-string lsp-bridge-server-port))
-                             (when lsp-bridge-enable-profile
-                               (list "profile"))
-                             )))
+    (if lsp-bridge-use-rust-backend
+        ;; Rust backend: single binary with EPC port as argument
+        (progn
+          (unless (file-executable-p lsp-bridge-rust-binary)
+            (error "[LSP-Bridge] Rust binary not found at %s. Build with: cd rust && cargo build --release"
+                   lsp-bridge-rust-binary))
+          (setq lsp-bridge-internal-process-prog lsp-bridge-rust-binary)
+          (setq lsp-bridge-internal-process-args
+                (list (number-to-string lsp-bridge-server-port))))
+      ;; Python backend (original)
+      (let* ((lsp-bridge-args (append
+                               (when (member lsp-bridge-python-command '("pipx" "uv"))
+                                 (list "run"))
+                               (list lsp-bridge-python-file)
+                               (list (number-to-string lsp-bridge-server-port))
+                               (when lsp-bridge-enable-profile
+                                 (list "profile"))
+                               )))
+        ;; Set process arguments.
+        (if lsp-bridge-enable-debug
+            (progn
+              (setq lsp-bridge-internal-process-prog "gdb")
+              (setq lsp-bridge-internal-process-args (append (list "-batch" "-ex" "run" "-ex" "bt" "--args" lsp-bridge-python-command) lsp-bridge-args)))
+          (setq lsp-bridge-internal-process-prog lsp-bridge-python-command)
+          (setq lsp-bridge-internal-process-args lsp-bridge-args))))
 
-      ;; Set process arguments.
-      (if lsp-bridge-enable-debug
-          (progn
-            (setq lsp-bridge-internal-process-prog "gdb")
-            (setq lsp-bridge-internal-process-args (append (list "-batch" "-ex" "run" "-ex" "bt" "--args" lsp-bridge-python-command) lsp-bridge-args)))
-        (setq lsp-bridge-internal-process-prog lsp-bridge-python-command)
-        (setq lsp-bridge-internal-process-args lsp-bridge-args))
-
-      ;; Start python process.
-      (let ((process-connection-type (not (lsp-bridge--called-from-wsl-on-windows-p))))
-        (setq lsp-bridge-internal-process
-              (apply 'start-process
-                     lsp-bridge-name lsp-bridge-name
-                     lsp-bridge-internal-process-prog lsp-bridge-internal-process-args)))
-      (with-current-buffer (process-buffer lsp-bridge-internal-process)
-        (setq-local ansi-color-context nil))
-      (set-process-filter lsp-bridge-internal-process #'lsp-bridge--process-log-output)
-      (set-process-query-on-exit-flag lsp-bridge-internal-process nil))))
+    ;; Start backend process.
+    (let ((process-connection-type (not (lsp-bridge--called-from-wsl-on-windows-p))))
+      (setq lsp-bridge-internal-process
+            (apply 'start-process
+                   lsp-bridge-name lsp-bridge-name
+                   lsp-bridge-internal-process-prog lsp-bridge-internal-process-args)))
+    (with-current-buffer (process-buffer lsp-bridge-internal-process)
+      (setq-local ansi-color-context nil))
+    (set-process-filter lsp-bridge-internal-process #'lsp-bridge--process-log-output)
+    (set-process-query-on-exit-flag lsp-bridge-internal-process nil)))
 
 (defun lsp-bridge--called-from-wsl-on-windows-p ()
   "Check whether lsp-bridge is called by Emacs on WSL and is running on Windows."
