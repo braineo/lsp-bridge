@@ -79,11 +79,15 @@ async fn main() -> Result<()> {
     let server_port = epc_server.port();
     tracing::info!("EPC server listening on port {}", server_port);
 
-    // STEP 3: Register EPC methods on our server.
-    let bridge = Arc::new(RwLock::new(LspBridge::new(base_dir)));
+    // STEP 3: Create bridge and inject Emacs client.
+    let mut bridge_inner = LspBridge::new(base_dir);
+    bridge_inner.set_emacs(emacs_client.clone());
+    let bridge = Arc::new(RwLock::new(bridge_inner));
+
+    // STEP 4: Register EPC methods on our server.
     register_methods(&epc_server, bridge.clone());
 
-    // STEP 4: Notify Emacs of our server port.
+    // STEP 5: Notify Emacs of our server port.
     // Python: eval_in_emacs('lsp-bridge--first-start', self.server.server_address[1])
     // This tells Emacs to connect to our EPC server.
     emacs_client
@@ -94,7 +98,7 @@ async fn main() -> Result<()> {
         .await?;
     tracing::info!("Notified Emacs: lsp-bridge--first-start {}", server_port);
 
-    // STEP 5: Accept the connection from Emacs to our EPC server.
+    // STEP 6: Accept the connection from Emacs to our EPC server.
     // After receiving lsp-bridge--first-start, Emacs calls lsp-bridge-epc-connect
     // to connect to our server port.
     let _epc_conn = epc_server.accept().await?;
@@ -338,6 +342,7 @@ mod tests {
         let _config = config::ServerConfig {
             name: "test".to_string(),
             language_id: "test".to_string(),
+            language_ids: std::collections::HashMap::new(),
             command: vec!["test-server".to_string()],
             settings: serde_json::Value::Null,
             project_files: vec![],

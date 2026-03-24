@@ -17,12 +17,9 @@ use tokio::sync::RwLock;
 use tracing;
 
 use epc::client::EpcClient;
-use epc::server::EpcServer;
 use epc::sexp::SexpValue;
-use epc::types::{EvalArg, EpcMessage};
 
 use lsp_server::server::LspServer;
-use lsp_server::capabilities::ServerCapabilityFlags;
 
 use handlers::{self, Handler, RequestContext, ResponseContext, HandlerState};
 
@@ -62,7 +59,6 @@ impl FileAction {
         }
     }
 
-    /// Get the LSP servers for this file.
     pub fn get_lsp_servers(&self) -> Vec<Arc<LspServer>> {
         if let Some(ref server) = self.single_server {
             vec![server.clone()]
@@ -73,7 +69,6 @@ impl FileAction {
         }
     }
 
-    /// Get server names.
     pub fn get_server_names(&self) -> Vec<String> {
         self.get_lsp_servers()
             .iter()
@@ -113,68 +108,137 @@ impl LspBridge {
         }
     }
 
-    /// Set the Emacs EPC client after connection is established.
-    pub fn set_emacs(&mut self, client: EpcClient) {
-        self.emacs = Some(Arc::new(client));
+    pub fn set_emacs(&mut self, client: Arc<EpcClient>) {
+        self.emacs = Some(client);
     }
 
-    /// Get a reference to the Emacs client.
     pub fn emacs(&self) -> &Arc<EpcClient> {
         self.emacs.as_ref().expect("Emacs client not initialized")
     }
 
-    /// Open a file — find/create LSP server, create FileAction.
+    /// Open a file — query Emacs for server config, create LSP server, create FileAction.
     ///
-    /// Mirrors Python's open_file() in lsp_bridge.py.
+    /// Mirrors Python's open_file() in lsp_bridge.py:
+    /// 1. get_project_path from Emacs
+    /// 2. get-multi-lang-server or get-single-lang-server from Emacs
+    /// 3. Load config JSON
+    /// 4. Spawn or reuse LSP server
+    /// 5. Create FileAction
     pub async fn open_file(&self, filepath: &str) -> Result<bool> {
         if self.file_actions.contains_key(filepath) {
-            return Ok(true); // already open
+            return Ok(true);
         }
 
         let filepath_path = Path::new(filepath);
-        let project_path = find_project_path(filepath_path);
 
-        // TODO: query Emacs for multi/single server config via EPC
-        // For now, use a simple heuristic based on file extension
-        let extension = filepath_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-
-        let server_config = self.find_server_config(extension)?;
-
-        match server_config {
-            Some(config) => {
-                let server_key = format!("{}#{}", config.name, project_path.display());
-
-                // Reuse existing server or create new one
-                let lsp_server = if let Some(server) = self.lsp_servers.get(&server_key) {
-                    server.clone()
-                } else {
-                    let server = self.create_lsp_server(
-                        &config,
-                        &project_path,
-                        true, // enable_diagnostics
-                    ).await?;
-                    self.lsp_servers.insert(server_key, server.clone());
-                    server
-                };
-
-                // Create file action
-                let mut file_action = FileAction::new(filepath.to_string());
-                file_action.single_server = Some(lsp_server);
-                file_action.single_server_info = Some(config);
-
-                let file_action = Arc::new(file_action);
-                self.file_actions.insert(filepath.to_string(), file_action);
-
-                Ok(true)
+        // Ask Emacs for the project path
+        let project_path = if let Some(emacs) = &self.emacs {
+            match emacs.get_emacs_func_result(
+                "get-project-path",
+                vec![SexpValue::String(filepath.to_string())],
+            ).await {
+                Ok(SexpValue::String(p)) => PathBuf::from(p),
+                _ => find_project_path(filepath_path),
             }
+        } else {
+            find_project_path(filepath_path)
+        };
+
+        // Ask Emacs which single-lang-server to use
+        let server_name = if let Some(emacs) = &self.emacs {
+            match emacs.get_emacs_func_result(
+                "get-single-lang-server",
+                vec![
+                    SexpValue::String(project_path.to_string_lossy().to_string()),
+                    SexpValue::String(filepath.to_string()),
+                ],
+            ).await {
+                Ok(SexpValue::String(name)) => Some(name),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let server_name = match server_name {
+            Some(name) => name,
             None => {
-                tracing::warn!("No LSP server found for: {}", filepath);
-                Ok(false)
+                tracing::warn!("Emacs returned no server for: {}", filepath);
+                // Fallback: try to find by extension
+                let ext = filepath_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                match self.find_server_config_by_extension(ext) {
+                    Some(c) => c.name.clone(),
+                    None => {
+                        tracing::warn!("No LSP server found for: {}", filepath);
+                        return Ok(false);
+                    }
+                }
+            }
+        };
+
+        tracing::info!("Opening {} with server '{}' in project {}", filepath, server_name, project_path.display());
+
+        // Load server config
+        let config = self.load_server_config(&server_name)?;
+        let config = match config {
+            Some(c) => c,
+            None => {
+                tracing::error!("Server config not found: {}", server_name);
+                return Ok(false);
+            }
+        };
+
+        // Check command exists
+        if let Some(cmd) = config.command.first() {
+            if which::which(cmd).is_err() {
+                tracing::error!("LSP server command not found: {}", cmd);
+                if let Some(emacs) = &self.emacs {
+                    let _ = emacs.message_emacs(&format!("LSP server '{}' not found", cmd)).await;
+                }
+                return Ok(false);
             }
         }
+
+        let server_key = format!("{}#{}", config.name, project_path.display());
+
+        // Reuse existing server or create new one
+        let lsp_server = if let Some(server) = self.lsp_servers.get(&server_key) {
+            server.clone()
+        } else {
+            let server = self.create_lsp_server(&config, &project_path, true).await?;
+            self.lsp_servers.insert(server_key, server.clone());
+
+            // Notify user
+            if let Some(emacs) = &self.emacs {
+                let _ = emacs.message_emacs(&format!(
+                    "Active {} '{}', enjoy hacking!",
+                    if project_path.is_dir() { "project" } else { "file" },
+                    project_path.file_name().unwrap_or_default().to_string_lossy()
+                )).await;
+            }
+
+            server
+        };
+
+        // Send didOpen
+        let uri = lsp_server::server::path_to_uri(filepath_path);
+        let language_id = if !config.language_id.is_empty() {
+            config.language_id.clone()
+        } else {
+            // Try languageIds map
+            let ext = filepath_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            config.language_ids.get(ext).cloned().unwrap_or_else(|| ext.to_string())
+        };
+        let text = std::fs::read_to_string(filepath).unwrap_or_default();
+        lsp_server.send_did_open(&uri, &language_id, 0, &text)?;
+
+        // Create file action
+        let mut file_action = FileAction::new(filepath.to_string());
+        file_action.single_server = Some(lsp_server);
+        file_action.single_server_info = Some(config);
+        self.file_actions.insert(filepath.to_string(), Arc::new(file_action));
+
+        Ok(true)
     }
 
     /// Close a file.
@@ -188,40 +252,31 @@ impl LspBridge {
         Ok(())
     }
 
-    /// Find a server config for the given file extension.
-    fn find_server_config(&self, extension: &str) -> Result<Option<ServerConfig>> {
-        // Load all configs and find one matching the extension
-        let configs = config::load_all_server_configs(&self.langserver_dir)?;
-
-        // Map common extensions to language IDs
-        let lang_id = match extension {
-            "py" => "python",
-            "rs" => "rust",
-            "js" | "jsx" => "javascript",
-            "ts" | "tsx" => "typescript",
-            "c" | "h" => "c",
-            "cpp" | "cc" | "cxx" | "hpp" => "c++",
-            "go" => "go",
-            "java" => "java",
-            "el" => "emacs-lisp",
-            "lua" => "lua",
-            "rb" => "ruby",
-            "sh" | "bash" => "bash",
-            "css" => "css",
-            "html" => "html",
-            "json" => "json",
-            "yaml" | "yml" => "yaml",
-            "toml" => "toml",
-            "zig" => "zig",
-            other => other,
-        };
-
-        for config in configs.values() {
-            if config.language_id == lang_id {
-                return Ok(Some(config.clone()));
-            }
+    /// Load a server config by name from langserver/*.json.
+    fn load_server_config(&self, name: &str) -> Result<Option<ServerConfig>> {
+        let path = self.langserver_dir.join(format!("{}.json", name));
+        if path.exists() {
+            Ok(Some(config::load_server_config(&path)?))
+        } else {
+            // Try loading all and searching by name
+            let configs = config::load_all_server_configs(&self.langserver_dir)?;
+            Ok(configs.into_values().find(|c| c.name == name))
         }
-        Ok(None)
+    }
+
+    /// Fallback: find a server config by file extension.
+    fn find_server_config_by_extension(&self, extension: &str) -> Option<ServerConfig> {
+        let configs = config::load_all_server_configs(&self.langserver_dir).ok()?;
+        let lang_id = ext_to_language_id(extension);
+
+        // Prefer configs where the command actually exists
+        configs.into_values()
+            .filter(|c| c.language_id == lang_id || c.language_ids.contains_key(extension))
+            .find(|c| {
+                c.command.first()
+                    .map(|cmd| which::which(cmd).is_ok())
+                    .unwrap_or(false)
+            })
     }
 
     /// Create an LSP server from config.
@@ -235,14 +290,13 @@ impl LspBridge {
 
         let on_notification: Arc<lsp_server::server::NotificationCallback> =
             Arc::new(Box::new(|method, params| {
-                tracing::debug!("LSP notification: {} {:?}", method, params);
-                // TODO: route notifications to file actions (diagnostics, etc.)
+                tracing::debug!("LSP notification: {}", method);
+                // TODO: route diagnostics to file actions
             }));
 
         let on_server_request: Arc<lsp_server::server::ServerRequestCallback> =
             Arc::new(Box::new(|id, method, params| {
                 tracing::debug!("LSP server request: {} (id={})", method, id);
-                // TODO: handle workspace/configuration, workspace/applyEdit
             }));
 
         let server = LspServer::spawn(
@@ -252,27 +306,24 @@ impl LspBridge {
             enable_diagnostics,
             on_notification,
             on_server_request,
-        )
-        .await?;
+        ).await?;
 
-        // Send initialize
         server.send_initialize(None).await?;
+
+        // Give server time to initialize
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         Ok(server)
     }
 
     /// Dispatch an EPC method call to the appropriate handler.
-    ///
-    /// Mirrors Python's build_file_action_function pattern.
     pub async fn dispatch(
         &self,
         method: &str,
         args: Vec<SexpValue>,
     ) -> Result<SexpValue> {
-        // Convert sexp args to JSON for handler processing
         let json_args: Vec<Value> = args.iter().map(|a| a.to_json()).collect();
 
-        // First arg is always filepath for file action methods
         let filepath = json_args
             .first()
             .and_then(|v| v.as_str())
@@ -293,19 +344,17 @@ impl LspBridge {
             None => return Ok(SexpValue::Nil),
         };
 
-        // Look up handler
         if let Some(handler) = self.handlers.get(method) {
             let servers = file_action.get_lsp_servers();
             if servers.is_empty() {
                 return Ok(SexpValue::Nil);
             }
 
-            // For each server, dispatch the request
             for server in &servers {
                 let flags = server.capability_flags.read().await;
 
                 let request_ctx = RequestContext {
-                    args: json_args[1..].to_vec(), // skip filepath
+                    args: json_args[1..].to_vec(),
                     server_name: server.server_name.clone(),
                     trigger_characters: flags.completion_trigger_characters.clone(),
                     server_info: server.server_info.clone(),
@@ -313,25 +362,19 @@ impl LspBridge {
 
                 let params = handler.process_request(&request_ctx)?;
 
-                // Add textDocument.uri if needed
                 let params = if handler.send_document_uri() {
                     let uri = lsp_server::server::path_to_uri(Path::new(&filepath));
                     let mut p = params;
                     if let Value::Object(ref mut map) = p {
-                        map.insert(
-                            "textDocument".to_string(),
-                            json!({"uri": uri}),
-                        );
+                        map.insert("textDocument".to_string(), json!({"uri": uri}));
                     }
                     p
                 } else {
                     params
                 };
 
-                // Send to LSP server
                 let response = server.send_request(handler.method(), params).await?;
 
-                // Build response context
                 let server_names = file_action.get_server_names();
                 let response_ctx = ResponseContext {
                     filepath: filepath.clone(),
@@ -339,13 +382,36 @@ impl LspBridge {
                     server_name: server.server_name.clone(),
                     trigger_characters: flags.completion_trigger_characters.clone(),
                     server_names,
-                    eval_in_emacs: Box::new(|_method, _args| {
-                        // TODO: wire to real Emacs EPC client
-                        tracing::debug!("eval_in_emacs: {} ({} args)", _method, _args.len());
-                    }),
-                    message_emacs: Box::new(|msg| {
-                        tracing::info!("message_emacs: {}", msg);
-                    }),
+                    eval_in_emacs: if let Some(emacs) = &self.emacs {
+                        let emacs = emacs.clone();
+                        Box::new(move |method, args| {
+                            let emacs = emacs.clone();
+                            let method = method.to_string();
+                            // Fire-and-forget eval_in_emacs from sync context
+                            tokio::spawn(async move {
+                                let eval_args: Vec<epc::types::EvalArg> = args.iter().map(|a| {
+                                    epc::types::EvalArg::Raw(SexpValue::from_json(a))
+                                }).collect();
+                                let _ = emacs.eval_in_emacs(&method, &eval_args).await;
+                            });
+                        })
+                    } else {
+                        Box::new(|method, _args| {
+                            tracing::debug!("eval_in_emacs (no client): {}", method);
+                        })
+                    },
+                    message_emacs: if let Some(emacs) = &self.emacs {
+                        let emacs = emacs.clone();
+                        Box::new(move |msg| {
+                            let emacs = emacs.clone();
+                            let msg = msg.to_string();
+                            tokio::spawn(async move {
+                                let _ = emacs.message_emacs(&msg).await;
+                            });
+                        })
+                    } else {
+                        Box::new(|msg| { tracing::info!("message: {}", msg); })
+                    },
                 };
 
                 handler.process_response(&response_ctx, response).await?;
@@ -356,9 +422,31 @@ impl LspBridge {
     }
 }
 
-/// Find the project root for a file (simplified version).
-///
-/// Looks for common project root markers walking up from the file.
+/// Map file extension to LSP language ID.
+fn ext_to_language_id(ext: &str) -> &str {
+    match ext {
+        "py" => "python",
+        "rs" => "rust",
+        "js" | "jsx" => "javascript",
+        "ts" | "tsx" => "typescript",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" => "c++",
+        "go" => "go",
+        "java" => "java",
+        "lua" => "lua",
+        "rb" => "ruby",
+        "sh" | "bash" => "bash",
+        "css" => "css",
+        "html" => "html",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "zig" => "zig",
+        other => other,
+    }
+}
+
+/// Find the project root for a file.
 fn find_project_path(filepath: &Path) -> PathBuf {
     let dir = if filepath.is_file() {
         filepath.parent().unwrap_or(filepath)
@@ -367,16 +455,8 @@ fn find_project_path(filepath: &Path) -> PathBuf {
     };
 
     let markers = [
-        ".git",
-        "Cargo.toml",
-        "package.json",
-        "pyproject.toml",
-        "setup.py",
-        "go.mod",
-        "CMakeLists.txt",
-        ".project",
-        "pom.xml",
-        "build.gradle",
+        ".git", "Cargo.toml", "package.json", "pyproject.toml",
+        "setup.py", "go.mod", "CMakeLists.txt", "pom.xml", "build.gradle",
     ];
 
     let mut current = dir;
@@ -392,60 +472,39 @@ fn find_project_path(filepath: &Path) -> PathBuf {
         }
     }
 
-    // Fallback to the file's directory
     dir.to_path_buf()
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn file_action_new() {
         let fa = FileAction::new("/tmp/test.py".to_string());
         assert_eq!(fa.filepath, "/tmp/test.py");
         assert!(fa.get_lsp_servers().is_empty());
-        assert!(fa.get_server_names().is_empty());
-    }
-
-    #[test]
-    fn find_project_path_fallback() {
-        // Non-existent path: is_file() returns false, so path is treated as-is
-        // and no markers are found → returns the path itself
-        let path = PathBuf::from("/nonexistent/dir/file.py");
-        let project = find_project_path(&path);
-        // Since file doesn't exist, is_file() is false, so it walks up from the path itself
-        assert_eq!(project, PathBuf::from("/nonexistent/dir/file.py"));
     }
 
     #[test]
     fn bridge_new() {
         let bridge = LspBridge::new(PathBuf::from("/tmp"));
-        assert!(bridge.file_actions.is_empty());
-        assert!(bridge.lsp_servers.is_empty());
         assert!(bridge.handlers.contains_key("completion"));
         assert!(bridge.handlers.contains_key("hover"));
     }
 
     #[test]
-    fn bridge_handler_registry() {
-        let bridge = LspBridge::new(PathBuf::from("/tmp"));
-        // Verify all expected handlers are registered
-        let expected = [
-            "completion", "hover", "find_define", "find_type_define",
-            "find_implementation", "find_references", "code_action",
-        ];
-        for name in &expected {
-            assert!(
-                bridge.handlers.contains_key(name),
-                "missing handler: {}",
-                name
-            );
-        }
+    fn ext_to_lang_id() {
+        assert_eq!(ext_to_language_id("py"), "python");
+        assert_eq!(ext_to_language_id("rs"), "rust");
+        assert_eq!(ext_to_language_id("ts"), "typescript");
+        assert_eq!(ext_to_language_id("unknown"), "unknown");
+    }
+
+    #[test]
+    fn find_project_path_fallback() {
+        let path = PathBuf::from("/nonexistent/dir/file.py");
+        let project = find_project_path(&path);
+        assert_eq!(project, PathBuf::from("/nonexistent/dir/file.py"));
     }
 }

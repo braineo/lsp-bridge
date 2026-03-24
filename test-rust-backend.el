@@ -11,6 +11,9 @@
 
 ;; Force Rust backend
 (setq lsp-bridge-use-rust-backend t)
+;; Use ty for Python (override user config for testing)
+(setq lsp-bridge-single-lang-server-mode-list
+      '(((python-mode python-ts-mode) . "ty")))
 
 (message "=== Rust backend test ===")
 (message "Binary: %s" lsp-bridge-rust-binary)
@@ -50,21 +53,46 @@
 
 ;; If connected, try a simple call
 (when lsp-bridge-epc-process
-  (message "Calling open_file on a test file...")
-  (let ((test-file (make-temp-file "lsp-bridge-test" nil ".py")))
+  ;; Create a test project with pyproject.toml so ty works
+  (let* ((test-dir (make-temp-file "lsp-bridge-test" t))
+         (test-file (expand-file-name "test.py" test-dir)))
+
+    ;; Create pyproject.toml for ty
+    (with-temp-file (expand-file-name "pyproject.toml" test-dir)
+      (insert "[project]\nname = \"test\"\n"))
+
+    ;; Create Python test file
     (with-temp-file test-file
-      (insert "import os\nos.path"))
+      (insert "import os\nos.path\n"))
+
+    (message "Test dir: %s" test-dir)
     (message "Test file: %s" test-file)
 
-    ;; Try to open
+    ;; Open the file
+    (message "Calling open_file...")
     (condition-case err
         (progn
           (lsp-bridge-call-async "open_file" test-file)
-          (sleep-for 3)
-          (message "open_file call sent"))
+          ;; Wait for server to start
+          (sleep-for 5)
+          (message "open_file done, waiting for server..."))
       (error (message "open_file error: %S" err)))
 
-    (delete-file test-file)))
+    ;; Try completion
+    (message "Calling try_completion...")
+    (condition-case err
+        (progn
+          (lsp-bridge-call-async "try_completion" test-file
+                                 '(:line 1 :character 7)  ;; after "os.path"
+                                 "."  ;; trigger char
+                                 "path"  ;; prefix
+                                 1)  ;; version
+          (sleep-for 3)
+          (message "try_completion sent"))
+      (error (message "try_completion error: %S" err)))
+
+    (delete-file test-file)
+    (delete-directory test-dir t)))
 
 (message "=== Test complete ===")
 
