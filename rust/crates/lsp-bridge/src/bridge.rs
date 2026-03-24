@@ -418,6 +418,76 @@ impl LspBridge {
         Ok(server)
     }
 
+    /// Helper: call eval_in_emacs with a method name and args.
+    async fn eval_in_emacs_method(&self, method: &str, args: Vec<Value>) {
+        if let Some(emacs) = &self.emacs {
+            let eval_args: Vec<epc::types::EvalArg> = args.iter().map(|a| {
+                epc::types::EvalArg::Raw(SexpValue::from_json(a))
+            }).collect();
+            if let Err(e) = emacs.eval_in_emacs(method, &eval_args).await {
+                tracing::error!("eval_in_emacs '{}' error: {}", method, e);
+            }
+        }
+    }
+
+    /// Handle completion response: build candidates and send to Emacs.
+    async fn handle_completion_response(
+        &self,
+        filepath: &str,
+        server_name: &str,
+        flags: &lsp_server::capabilities::ServerCapabilityFlags,
+        prefix: &str,
+        position: &Value,
+        response: Value,
+    ) {
+        let items = if let Some(items) = response.get("items").and_then(|i| i.as_array()) {
+            items.clone()
+        } else if response.is_array() {
+            response.as_array().cloned().unwrap_or_default()
+        } else {
+            return;
+        };
+
+        let mut candidates: Vec<Value> = Vec::new();
+        for item in &items {
+            let kind_num = item.get("kind").and_then(|k| k.as_u64()).unwrap_or(0);
+            let kind = handlers::kind_name(kind_num).to_lowercase();
+            let label = item.get("label").and_then(|l| l.as_str()).unwrap_or("");
+            let detail = item.get("detail").and_then(|d| d.as_str()).unwrap_or("");
+            let annotation = if !kind.is_empty() { &kind } else { detail };
+            let key = format!("{}_{}", label, detail);
+
+            candidates.push(json!({
+                "key": key,
+                "icon": annotation,
+                "label": label,
+                "displayLabel": label,
+                "deprecated": item.get("tags").and_then(|t| t.as_array())
+                    .map(|tags| tags.iter().any(|t| t.as_u64() == Some(1)))
+                    .unwrap_or(false),
+                "insertText": item.get("insertText"),
+                "insertTextFormat": item.get("insertTextFormat").cloned().unwrap_or(Value::String(String::new())),
+                "textEdit": item.get("textEdit"),
+                "score": item.get("score").and_then(|s| s.as_f64()).unwrap_or(1000.0),
+                "sortText": item.get("sortText").and_then(|s| s.as_str()).unwrap_or(""),
+                "filterText": item.get("filterText"),
+                "server": server_name,
+                "backend": "lsp"
+            }));
+        }
+
+        self.eval_in_emacs_method("lsp-bridge-completion--record-items", vec![
+            Value::String(filepath.to_string()),
+            Value::String(String::new()), // host
+            Value::Array(candidates),
+            position.clone(),
+            Value::String(server_name.to_string()),
+            Value::Array(flags.completion_trigger_characters.iter()
+                .map(|s| Value::String(s.clone())).collect()),
+            Value::Array(vec![Value::String(server_name.to_string())]),
+        ]).await;
+    }
+
     /// Dispatch an EPC method call to the appropriate handler.
     ///
     /// Never propagates errors — logs them instead. This prevents a single
@@ -537,7 +607,87 @@ impl LspBridge {
                 return Ok(());
             }
             "list_diagnostics" => {
-                // Not a handler — just show diagnostics
+                return Ok(());
+            }
+            "try_code_action" | "code_action" => {
+                // Python: try_code_action(range_start, range_end, action_kind)
+                // Preprocesses: adds server_name and diagnostics before calling handler
+                let range_start = json_args.get(1).cloned().unwrap_or(Value::Null);
+                let range_end = json_args.get(2).cloned().unwrap_or(Value::Null);
+                let action_kind = json_args.get(3).cloned().unwrap_or(Value::Null);
+
+                for server in file_action.get_lsp_servers() {
+                    let flags = server.capability_flags.read().await;
+                    if !flags.code_action_provider { continue; }
+
+                    let uri = lsp_server::server::path_to_uri(Path::new(&filepath));
+                    let mut context = json!({"diagnostics": []});
+                    if let Some(kind_str) = action_kind.as_str() {
+                        context["only"] = json!([kind_str]);
+                    }
+
+                    let params = json!({
+                        "textDocument": {"uri": uri},
+                        "range": {"start": range_start, "end": range_end},
+                        "context": context
+                    });
+
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        server.send_request("textDocument/codeAction", params),
+                    ).await {
+                        Ok(Ok(response)) if !response.is_null() && !response.get("error").is_some() => {
+                            if let Some(actions) = response.as_array() {
+                                if !actions.is_empty() {
+                                    self.eval_in_emacs_method("lsp-bridge-code-action--fix",
+                                        vec![response, action_kind.clone()]).await;
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => tracing::warn!("code_action error: {}", e),
+                        Err(_) => tracing::warn!("code_action timed out"),
+                        _ => {}
+                    }
+                }
+                return Ok(());
+            }
+            "try_completion" | "completion" => {
+                // Python: try_completion(position, before_char, prefix, version)
+                // Sends textDocument/completion with proper trigger context
+                let position = json_args.get(1).cloned().unwrap_or(Value::Null);
+                let before_char = json_args.get(2).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let prefix = json_args.get(3).and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                for server in file_action.get_lsp_servers() {
+                    let flags = server.capability_flags.read().await;
+                    let uri = lsp_server::server::path_to_uri(Path::new(&filepath));
+
+                    let context = if flags.completion_trigger_characters.iter().any(|tc| tc == &before_char) {
+                        json!({"triggerKind": 2, "triggerCharacter": before_char})
+                    } else {
+                        json!({"triggerKind": 1})
+                    };
+
+                    let params = json!({
+                        "textDocument": {"uri": uri},
+                        "position": position,
+                        "context": context
+                    });
+
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        server.send_request("textDocument/completion", params),
+                    ).await {
+                        Ok(Ok(response)) if !response.is_null() && !response.get("error").is_some() => {
+                            self.handle_completion_response(
+                                &filepath, &server.server_name, &flags, &prefix, &position, response,
+                            ).await;
+                        }
+                        Ok(Err(e)) => tracing::warn!("completion error: {}", e),
+                        Err(_) => tracing::warn!("completion timed out"),
+                        _ => {}
+                    }
+                }
                 return Ok(());
             }
             _ => {} // Fall through to handler dispatch
