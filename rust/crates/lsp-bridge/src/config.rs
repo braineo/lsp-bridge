@@ -13,9 +13,14 @@ pub struct ServerConfig {
     /// Server name (e.g., "pyright", "rust-analyzer")
     pub name: String,
 
-    /// Language ID (e.g., "python", "rust")
-    #[serde(rename = "languageId")]
+    /// Language ID (e.g., "python", "rust"). Empty if using languageIds map.
+    #[serde(default, rename = "languageId")]
     pub language_id: String,
+
+    /// Language IDs map: extension → language ID (e.g., {"tsx": "typescriptreact"})
+    /// Used when a server supports multiple languages.
+    #[serde(default, rename = "languageIds")]
+    pub language_ids: std::collections::HashMap<String, String>,
 
     /// Command to start the server
     pub command: Vec<String>,

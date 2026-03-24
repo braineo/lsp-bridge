@@ -250,6 +250,72 @@ fn register_methods(server: &EpcServer, bridge: Arc<RwLock<LspBridge>>) {
             }
         }
     });
+
+    // update_file, try_formatting, change_cursor, list_diagnostics, workspace_symbol
+    for method in &["update_file", "try_formatting", "change_cursor", "list_diagnostics", "workspace_symbol"] {
+        let b = bridge.clone();
+        let name = method.to_string();
+        server.register(*method, move |args| {
+            let b = b.clone();
+            let name = name.clone();
+            async move {
+                tracing::debug!("EPC method called: {}", name);
+                let bridge = b.read().await;
+                let _ = bridge.dispatch(&name, args).await;
+                Ok(SexpValue::Nil)
+            }
+        });
+    }
+
+    // Search backend stubs — Emacs calls these right after connection.
+    // Python: build_prefix_function registers "search_file_words_index_files", etc.
+    let search_methods = [
+        "search_file_words_index_files",
+        "search_file_words_change_buffer",
+        "search_file_words_load_file",
+        "search_file_words_close_file",
+        "search_file_words_search",
+        "search_sdcv_words_search",
+        "search_list_search",
+        "search_list_update",
+        "search_paths_search",
+    ];
+    for method in &search_methods {
+        server.register(*method, move |args| {
+            async move {
+                tracing::debug!("Search method called: {} ({} args)", stringify!($method), args.len());
+                Ok(SexpValue::Nil)
+            }
+        });
+    }
+
+    // Other methods Emacs may call
+    let stub_methods = [
+        "close_all_files",
+        "rename_file",
+        "fetch_completion_item_info",
+        "tabnine_complete",
+        "copilot_complete",
+        "copilot_login",
+        "copilot_logout",
+        "copilot_status",
+        "copilot_completion_accept",
+        "codeium_complete",
+        "codeium_completion_accept",
+        "codeium_auth",
+        "codeium_get_api_key",
+        "ctags_complete",
+        "ctags_find_def",
+        "cleanup",
+        "profile_dump",
+    ];
+    for method in &stub_methods {
+        server.register(*method, move |_args| {
+            async move {
+                Ok(SexpValue::Nil)
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -546,8 +546,47 @@ async fn handle_incoming(
             on_notification(method, params);
         }
         IncomingMessage::Request { id, method, params } => {
-            // Server-initiated requests (e.g., workspace/configuration)
-            // Per LSP 3.17: client must respond
+            // Server-initiated requests — must respond per LSP 3.17.
+            // Handle common ones automatically, delegate the rest.
+            let response_json = match method.as_str() {
+                // §3.6.4: workspace/configuration — return settings
+                "workspace/configuration" => {
+                    // Return empty config for each requested item
+                    let items_len = params.get("items")
+                        .and_then(|i| i.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(1);
+                    Some(types::build_response(id, serde_json::json!(
+                        vec![serde_json::Value::Object(serde_json::Map::new()); items_len]
+                    )))
+                }
+                // §3.18.20: window/workDoneProgress/create — acknowledge
+                "window/workDoneProgress/create" => {
+                    Some(types::build_response(id, serde_json::Value::Null))
+                }
+                // §3.7.1: client/registerCapability — acknowledge
+                "client/registerCapability" => {
+                    Some(types::build_response(id, serde_json::Value::Null))
+                }
+                // §3.18.21: workspace/applyEdit — acknowledge
+                "workspace/applyEdit" => {
+                    Some(types::build_response(id, serde_json::json!({"applied": true})))
+                }
+                // workspace/diagnostic/refresh — acknowledge
+                "workspace/diagnostic/refresh" => {
+                    Some(types::build_response(id, serde_json::Value::Null))
+                }
+                _ => None,
+            };
+
+            if let Some(json) = response_json {
+                // Send response directly via the writer
+                if let Some(srv) = server.upgrade() {
+                    let _ = srv.writer_tx.send(OutgoingMessage::Normal(json));
+                }
+            }
+
+            // Also notify the callback for custom handling
             on_server_request(id, method, params);
         }
     }
