@@ -389,13 +389,15 @@ class LspBridge:
             self.remote_file_elisp_receiver_queue.put(message)
 
     def receive_message_dispatcher(self, queue, handle_remote_message):
-        try:
-            while True:
+        while True:
+            try:
                 message = queue.get(True)
                 handle_remote_message(message)
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                message_emacs(f"Receive message dispatcher error: {e}. Check *lsp-bridge* buffer.")
+            finally:
                 queue.task_done()
-        except:
-            logger.error(traceback.format_exc())
 
     def remote_sync(self, host, remote_connection_info):
         client_id = f"{host}:{REMOTE_FILE_ELISP_CHANNEL}"
@@ -696,8 +698,8 @@ class LspBridge:
 
     # Functions for local handling
     def event_dispatcher(self):
-        try:
-            while True:
+        while True:
+            try:
                 message = self.event_queue.get(True)
 
                 if message["name"] == "close_file":
@@ -706,22 +708,25 @@ class LspBridge:
                     (func_name, func_args) = message["content"]
                     getattr(self, func_name)(*func_args)
 
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                message_emacs(f"Event dispatcher error: {e}. Check *lsp-bridge* buffer.")
+            finally:
                 self.event_queue.task_done()
-        except:
-            logger.error(traceback.format_exc())
 
     def message_dispatcher(self):
-        try:
-            while True:
+        while True:
+            try:
                 message = self.message_queue.get(True)
                 if message["name"] == "server_process_exit":
                     self.handle_server_process_exit(message["content"])
                 else:
                     logger.error("Unhandled lsp-bridge message: %s" % message)
-
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                message_emacs(f"Message dispatcher error: {e}. Check *lsp-bridge*.")
+            finally:
                 self.message_queue.task_done()
-        except:
-            logger.error(traceback.format_exc())
 
     def rename_file(self, old_filepath, new_filepath):
         if is_in_path_dict(FILE_ACTION_DICT, old_filepath):

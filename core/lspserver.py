@@ -360,12 +360,13 @@ class LspServer:
         self.send_did_open_notification(fa)
 
     def lsp_message_dispatcher(self):
-        try:
-            while True:
+        while True:
+            try:
                 message = self.receiver.get_message()
                 self.handle_recv_message(message["content"])
-        except:
-            logger.error(traceback.format_exc())
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                message_emacs(f"Lsp Server message dispatcher error: {e}. Check *lsp-bridge* buffer.")
 
     def send_initialize_request(self):
         initialize_options = self.server_info.get("initializationOptions", {})
