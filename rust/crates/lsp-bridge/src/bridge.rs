@@ -317,11 +317,26 @@ impl LspBridge {
     }
 
     /// Dispatch an EPC method call to the appropriate handler.
+    ///
+    /// Never propagates errors — logs them instead. This prevents a single
+    /// failed LSP request from killing the EPC connection (which would cause
+    /// "client exited without proper shutdown sequence" in LSP servers).
     pub async fn dispatch(
         &self,
         method: &str,
         args: Vec<SexpValue>,
     ) -> Result<SexpValue> {
+        if let Err(e) = self.dispatch_inner(method, args).await {
+            tracing::error!("dispatch '{}' error: {}", method, e);
+        }
+        Ok(SexpValue::Nil)
+    }
+
+    async fn dispatch_inner(
+        &self,
+        method: &str,
+        args: Vec<SexpValue>,
+    ) -> Result<()> {
         let json_args: Vec<Value> = args.iter().map(|a| a.to_json()).collect();
 
         let filepath = json_args
@@ -331,94 +346,133 @@ impl LspBridge {
             .to_string();
 
         if filepath.is_empty() {
-            return Ok(SexpValue::Nil);
+            return Ok(());
         }
 
         // Ensure file is open
         if !self.file_actions.contains_key(&filepath) {
-            self.open_file(&filepath).await?;
+            if let Err(e) = self.open_file(&filepath).await {
+                tracing::error!("open_file for dispatch '{}': {}", method, e);
+                return Ok(());
+            }
         }
 
         let file_action = match self.file_actions.get(&filepath) {
             Some(fa) => fa.clone(),
-            None => return Ok(SexpValue::Nil),
+            None => return Ok(()),
         };
 
-        if let Some(handler) = self.handlers.get(method) {
-            let servers = file_action.get_lsp_servers();
-            if servers.is_empty() {
-                return Ok(SexpValue::Nil);
+        let handler = match self.handlers.get(method) {
+            Some(h) => h,
+            None => {
+                tracing::debug!("no handler for method: {}", method);
+                return Ok(());
+            }
+        };
+
+        let servers = file_action.get_lsp_servers();
+        if servers.is_empty() {
+            return Ok(());
+        }
+
+        for server in &servers {
+            let flags = server.capability_flags.read().await;
+
+            let request_ctx = RequestContext {
+                args: json_args[1..].to_vec(),
+                server_name: server.server_name.clone(),
+                trigger_characters: flags.completion_trigger_characters.clone(),
+                server_info: server.server_info.clone(),
+            };
+
+            let params = match handler.process_request(&request_ctx) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("handler '{}' process_request error: {}", method, e);
+                    continue;
+                }
+            };
+
+            let params = if handler.send_document_uri() {
+                let uri = lsp_server::server::path_to_uri(Path::new(&filepath));
+                let mut p = params;
+                if let Value::Object(ref mut map) = p {
+                    map.insert("textDocument".to_string(), json!({"uri": uri}));
+                }
+                p
+            } else {
+                params
+            };
+
+            // Send request with timeout to avoid hanging forever
+            let response = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                server.send_request(handler.method(), params),
+            ).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    tracing::error!("handler '{}' LSP request error: {}", method, e);
+                    continue;
+                }
+                Err(_) => {
+                    tracing::error!("handler '{}' LSP request timed out (30s)", method);
+                    continue;
+                }
+            };
+
+            // Check for LSP error response
+            if response.get("error").is_some() {
+                tracing::warn!("handler '{}' LSP error: {}", method,
+                    response["error"].get("message").and_then(|m| m.as_str()).unwrap_or("unknown"));
+                continue;
             }
 
-            for server in &servers {
-                let flags = server.capability_flags.read().await;
-
-                let request_ctx = RequestContext {
-                    args: json_args[1..].to_vec(),
-                    server_name: server.server_name.clone(),
-                    trigger_characters: flags.completion_trigger_characters.clone(),
-                    server_info: server.server_info.clone(),
-                };
-
-                let params = handler.process_request(&request_ctx)?;
-
-                let params = if handler.send_document_uri() {
-                    let uri = lsp_server::server::path_to_uri(Path::new(&filepath));
-                    let mut p = params;
-                    if let Value::Object(ref mut map) = p {
-                        map.insert("textDocument".to_string(), json!({"uri": uri}));
-                    }
-                    p
+            let server_names = file_action.get_server_names();
+            let response_ctx = ResponseContext {
+                filepath: filepath.clone(),
+                host: String::new(),
+                server_name: server.server_name.clone(),
+                trigger_characters: flags.completion_trigger_characters.clone(),
+                server_names,
+                eval_in_emacs: if let Some(emacs) = &self.emacs {
+                    let emacs = emacs.clone();
+                    Box::new(move |method, args| {
+                        let emacs = emacs.clone();
+                        let method = method.to_string();
+                        tokio::spawn(async move {
+                            let eval_args: Vec<epc::types::EvalArg> = args.iter().map(|a| {
+                                epc::types::EvalArg::Raw(SexpValue::from_json(a))
+                            }).collect();
+                            if let Err(e) = emacs.eval_in_emacs(&method, &eval_args).await {
+                                tracing::error!("eval_in_emacs '{}' error: {}", method, e);
+                            }
+                        });
+                    })
                 } else {
-                    params
-                };
-
-                let response = server.send_request(handler.method(), params).await?;
-
-                let server_names = file_action.get_server_names();
-                let response_ctx = ResponseContext {
-                    filepath: filepath.clone(),
-                    host: String::new(),
-                    server_name: server.server_name.clone(),
-                    trigger_characters: flags.completion_trigger_characters.clone(),
-                    server_names,
-                    eval_in_emacs: if let Some(emacs) = &self.emacs {
+                    Box::new(|method, _args| {
+                        tracing::debug!("eval_in_emacs (no client): {}", method);
+                    })
+                },
+                message_emacs: if let Some(emacs) = &self.emacs {
+                    let emacs = emacs.clone();
+                    Box::new(move |msg| {
                         let emacs = emacs.clone();
-                        Box::new(move |method, args| {
-                            let emacs = emacs.clone();
-                            let method = method.to_string();
-                            // Fire-and-forget eval_in_emacs from sync context
-                            tokio::spawn(async move {
-                                let eval_args: Vec<epc::types::EvalArg> = args.iter().map(|a| {
-                                    epc::types::EvalArg::Raw(SexpValue::from_json(a))
-                                }).collect();
-                                let _ = emacs.eval_in_emacs(&method, &eval_args).await;
-                            });
-                        })
-                    } else {
-                        Box::new(|method, _args| {
-                            tracing::debug!("eval_in_emacs (no client): {}", method);
-                        })
-                    },
-                    message_emacs: if let Some(emacs) = &self.emacs {
-                        let emacs = emacs.clone();
-                        Box::new(move |msg| {
-                            let emacs = emacs.clone();
-                            let msg = msg.to_string();
-                            tokio::spawn(async move {
-                                let _ = emacs.message_emacs(&msg).await;
-                            });
-                        })
-                    } else {
-                        Box::new(|msg| { tracing::info!("message: {}", msg); })
-                    },
-                };
+                        let msg = msg.to_string();
+                        tokio::spawn(async move {
+                            let _ = emacs.message_emacs(&msg).await;
+                        });
+                    })
+                } else {
+                    Box::new(|msg| { tracing::info!("message: {}", msg); })
+                },
+            };
 
-                handler.process_response(&response_ctx, response).await?;
+            if let Err(e) = handler.process_response(&response_ctx, response).await {
+                tracing::error!("handler '{}' process_response error: {}", method, e);
             }
         }
 
-        Ok(SexpValue::Nil)
+        Ok(())
     }
 }
 

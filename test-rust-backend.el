@@ -78,17 +78,38 @@
           (message "open_file done, waiting for server..."))
       (error (message "open_file error: %S" err)))
 
+    ;; Intercept completion callback to verify data arrives
+    (defvar test-completion-received nil)
+    (defun lsp-bridge-completion--record-items (&rest args)
+      (setq test-completion-received t)
+      (message "COMPLETION RECEIVED! %d args" (length args))
+      (when (>= (length args) 3)
+        (let ((candidates (nth 2 args)))
+          (message "  %d candidates" (if (listp candidates) (length candidates) 0))
+          (when (and (listp candidates) candidates)
+            (dolist (c (seq-take candidates 5))
+              (message "    - %s (icon=%s)"
+                       (if (listp c) (plist-get c :label) c)
+                       (if (listp c) (plist-get c :icon) "?")))))))
+
     ;; Try completion
     (message "Calling try_completion...")
     (condition-case err
         (progn
           (lsp-bridge-call-async "try_completion" test-file
-                                 '(:line 1 :character 7)  ;; after "os.path"
-                                 "."  ;; trigger char
-                                 "path"  ;; prefix
-                                 1)  ;; version
-          (sleep-for 3)
-          (message "try_completion sent"))
+                                 '(:line 1 :character 7)
+                                 "."
+                                 "path"
+                                 1)
+          ;; Wait for async response
+          (let ((wait 0))
+            (while (and (not test-completion-received) (< wait 10))
+              (accept-process-output nil 1)
+              (setq wait (1+ wait))
+              (message "  waiting for completion... %ds" wait)))
+          (if test-completion-received
+              (message "COMPLETION TEST PASSED!")
+            (message "COMPLETION TEST FAILED: no response after 10s")))
       (error (message "try_completion error: %S" err)))
 
     (delete-file test-file)

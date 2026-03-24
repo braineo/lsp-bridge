@@ -113,6 +113,25 @@ async fn main() -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 
+    // Graceful shutdown: send shutdown+exit to all LSP servers
+    tracing::info!("Shutting down all LSP servers...");
+    {
+        let bridge = bridge.read().await;
+        for entry in bridge.lsp_servers.iter() {
+            let server = entry.value();
+            tracing::info!("Shutting down LSP server: {}", server.server_name);
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                server.shutdown(),
+            ).await {
+                Ok(Ok(())) => tracing::info!("  {} shutdown OK", server.server_name),
+                Ok(Err(e)) => tracing::warn!("  {} shutdown error: {}", server.server_name, e),
+                Err(_) => tracing::warn!("  {} shutdown timed out", server.server_name),
+            }
+        }
+    }
+
+    tracing::info!("lsp-bridge exiting");
     Ok(())
 }
 
