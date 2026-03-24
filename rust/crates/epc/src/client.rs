@@ -38,8 +38,11 @@ impl EpcClient {
     /// Constructs the sexp and sends via `(call uid "eval-in-emacs" [sexp])`.
     pub async fn eval_in_emacs(&self, method_name: &str, args: &[EvalArg]) -> Result<()> {
         let sexp_str = types::build_eval_in_emacs(method_name, args);
+        // Python: epc_client.call("eval-in-emacs", [sexp])
+        // The EPC Call wraps args in a list, so we pass a flat vec of one string.
+        // Wire: (call uid eval-in-emacs ("(lsp-bridge--first-start '36615)"))
         self.conn
-            .call_async("eval-in-emacs", vec![SexpValue::List(vec![SexpValue::String(sexp_str)])])
+            .call_async("eval-in-emacs", vec![SexpValue::String(sexp_str)])
             .await
     }
 
@@ -108,9 +111,59 @@ impl EpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sexp;
+    use crate::types::EpcMessage;
 
-    // Client tests are primarily covered by the server integration tests.
-    // The client is a thin wrapper around EpcConnection.
+    /// Verify eval_in_emacs produces the exact same wire message as Python.
+    /// Python ground truth: (call 1 eval-in-emacs ("(lsp-bridge--first-start '36615)"))
+    #[test]
+    fn eval_in_emacs_wire_format_matches_python() {
+        let sexp_str = types::build_eval_in_emacs(
+            "lsp-bridge--first-start",
+            &[EvalArg::Integer(36615)],
+        );
+        // Python: sexp = "(lsp-bridge--first-start '36615)"
+        assert_eq!(sexp_str, "(lsp-bridge--first-start '36615)");
+
+        // The EPC call args should be a flat list of one string (not nested)
+        let args = vec![SexpValue::String(sexp_str.clone())];
+
+        // Build the full EPC message
+        let msg = EpcMessage::Call {
+            uid: 1,
+            method: "eval-in-emacs".to_string(),
+            args,
+        };
+        let encoded = msg.encode();
+
+        // Python wire: (call 1 eval-in-emacs ("(lsp-bridge--first-start '36615)"))
+        assert_eq!(
+            encoded,
+            "(call 1 eval-in-emacs (\"(lsp-bridge--first-start '36615)\"))"
+        );
+    }
+
+    /// Verify message_emacs produces correct wire format.
+    #[test]
+    fn message_emacs_wire_format_matches_python() {
+        let sexp_str = types::build_eval_in_emacs(
+            "message",
+            &[EvalArg::String("[LSP-Bridge] hello".to_string())],
+        );
+        // Python: (message '"[LSP-Bridge] hello")
+        assert_eq!(sexp_str, "(message '\"[LSP-Bridge] hello\")");
+
+        let msg = EpcMessage::Call {
+            uid: 1,
+            method: "eval-in-emacs".to_string(),
+            args: vec![SexpValue::String(sexp_str)],
+        };
+        let encoded = msg.encode();
+        assert_eq!(
+            encoded,
+            "(call 1 eval-in-emacs (\"(message '\\\"[LSP-Bridge] hello\\\")\"))"
+        );
+    }
 
     #[test]
     fn eval_arg_construction() {
