@@ -1,0 +1,182 @@
+[
+  {
+    "name": "eval_in_emacs_message",
+    "sexp": "(message '\"[LSP-Bridge] hello\")",
+    "wire_hex": "000020",
+    "wire_len": 32
+  },
+  {
+    "name": "eval_in_emacs_quoted_symbol",
+    "sexp": "(func 'python-mode)",
+    "wire_hex": "000014",
+    "wire_len": 20
+  },
+  {
+    "name": "eval_in_emacs_jump",
+    "sexp": "(lsp-bridge-define--jump '\"/tmp/test.py\" '\"localhost\" '10 '5)",
+    "wire_hex": "00003e",
+    "wire_len": 62
+  },
+  {
+    "name": "eval_in_emacs_completion_record",
+    "sexp": "(lsp-bridge-completion--record-items '\"file.py\" '\"localhost\" '((:label \"print\" :kind \"Function\")) '(:line 10 :character 5) '\"pyright\" '(\".\") '(\"pyright\"))",
+    "wire_hex": "00009b",
+    "wire_len": 155
+  },
+  {
+    "name": "dumps_integer",
+    "sexp": "42",
+    "wire_hex": "000003",
+    "wire_len": 3
+  },
+  {
+    "name": "dumps_neg_integer",
+    "sexp": "-7",
+    "wire_hex": "000003",
+    "wire_len": 3
+  },
+  {
+    "name": "dumps_float",
+    "sexp": "3.14",
+    "wire_hex": "000005",
+    "wire_len": 5
+  },
+  {
+    "name": "dumps_float_zero",
+    "sexp": "0.0",
+    "wire_hex": "000004",
+    "wire_len": 4
+  },
+  {
+    "name": "dumps_float_whole",
+    "sexp": "5.0",
+    "wire_hex": "000004",
+    "wire_len": 4
+  },
+  {
+    "name": "dumps_string",
+    "sexp": "\"hello world\"",
+    "wire_hex": "00000e",
+    "wire_len": 14
+  },
+  {
+    "name": "dumps_unicode",
+    "sexp": "\"测试\"",
+    "wire_hex": "000009",
+    "wire_len": 9
+  },
+  {
+    "name": "dumps_string_with_quotes",
+    "sexp": "\"he said \\\"hi\\\"\"",
+    "wire_hex": "000011",
+    "wire_len": 17
+  },
+  {
+    "name": "dumps_string_with_newline",
+    "sexp": "\"line\\nbreak\"",
+    "wire_hex": "00000e",
+    "wire_len": 14
+  },
+  {
+    "name": "dumps_string_with_tab",
+    "sexp": "\"col\\tcol\"",
+    "wire_hex": "00000b",
+    "wire_len": 11
+  },
+  {
+    "name": "dumps_string_backslash",
+    "sexp": "\"C:\\\\Users\\\\test\"",
+    "wire_hex": "000012",
+    "wire_len": 18
+  },
+  {
+    "name": "dumps_empty_string",
+    "sexp": "\"\"",
+    "wire_hex": "000003",
+    "wire_len": 3
+  },
+  {
+    "name": "dumps_symbol",
+    "sexp": "method-name",
+    "wire_hex": "00000c",
+    "wire_len": 12
+  },
+  {
+    "name": "dumps_symbol_slash",
+    "sexp": "textDocument/completion",
+    "wire_hex": "000018",
+    "wire_len": 24
+  },
+  {
+    "name": "dumps_nil",
+    "sexp": "()",
+    "wire_hex": "00003",
+    "wire_len": 3
+  },
+  {
+    "name": "dumps_true",
+    "sexp": "t",
+    "wire_hex": "000002",
+    "wire_len": 2
+  },
+  {
+    "name": "dumps_list_ints",
+    "sexp": "(1 2 3)",
+    "wire_hex": "000008",
+    "wire_len": 8
+  },
+  {
+    "name": "dumps_nested",
+    "sexp": "(a (b c) d)",
+    "wire_hex": "00000c",
+    "wire_len": 12
+  },
+  {
+    "name": "dumps_keyword_plist",
+    "sexp": "(:a 1 :b 2)",
+    "wire_hex": "00000c",
+    "wire_len": 12
+  },
+  {
+    "name": "dumps_quoted_sym",
+    "sexp": "'sym",
+    "wire_hex": "000005",
+    "wire_len": 5
+  },
+  {
+    "name": "dumps_quoted_list",
+    "sexp": "'(1 2 3)",
+    "wire_hex": "000009",
+    "wire_len": 9
+  },
+  {
+    "name": "epc_call",
+    "sexp": "(call 42 open_file (\"/tmp/test.py\"))",
+    "wire_hex": "000025",
+    "wire_len": 37
+  },
+  {
+    "name": "epc_return",
+    "sexp": "(return 42 \"ok\")",
+    "wire_hex": "000011",
+    "wire_len": 17
+  },
+  {
+    "name": "epc_return_error",
+    "sexp": "(return-error 42 \"method not found\")",
+    "wire_hex": "000025",
+    "wire_len": 37
+  },
+  {
+    "name": "epc_epc_error",
+    "sexp": "(epc-error 42 \"protocol error\")",
+    "wire_hex": "000020",
+    "wire_len": 32
+  },
+  {
+    "name": "epc_methods",
+    "sexp": "(methods 1)",
+    "wire_hex": "00000c",
+    "wire_len": 12
+  }
+]
