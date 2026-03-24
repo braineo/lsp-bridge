@@ -181,26 +181,90 @@ impl LspBridge {
             }
         }
 
-        // For multi-server: load the multi-server config and use its "default" server.
-        // If multi-server config fails, fall through to single-server.
-        let server_name = if let Some(multi_name) = &multi_server_name {
+        // Multi-server: spawn ALL servers in the config
+        if let Some(multi_name) = &multi_server_name {
             let multi_path = self.multiserver_dir.join(format!("{}.json", multi_name));
             if let Ok(multi_config) = config::load_multi_server_config(&multi_path) {
-                tracing::info!("Multi-server config '{}', using default: {}", multi_name, multi_config.default);
-                Some(multi_config.default)
-            } else {
-                tracing::debug!("No multi-server config file for '{}', trying single-server", multi_name);
-                None
-            }
-        } else {
-            None
-        };
+                // Collect unique server names from all methods
+                let mut server_names: Vec<String> = Vec::new();
+                let multi_json: serde_json::Value = serde_json::to_value(&multi_config).unwrap_or_default();
+                for (_key, val) in multi_json.as_object().unwrap_or(&serde_json::Map::new()) {
+                    match val {
+                        Value::String(s) => {
+                            if !server_names.contains(s) { server_names.push(s.clone()); }
+                        }
+                        Value::Array(arr) => {
+                            for item in arr {
+                                if let Some(s) = item.as_str() {
+                                    if !server_names.contains(&s.to_string()) {
+                                        server_names.push(s.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
 
-        // Fall through to single-server if multi didn't resolve
-        let server_name = server_name
-            .or(single_server_name)
+                tracing::info!("Multi-server '{}': spawning servers {:?}", multi_name, server_names);
+
+                let mut multi_servers = HashMap::new();
+                let diagnostics_servers: Vec<String> = multi_config.diagnostics.as_ref()
+                    .map(|t| t.names().iter().map(|s| s.to_string()).collect())
+                    .unwrap_or_default();
+
+                for sname in &server_names {
+                    if let Some(cfg) = self.load_server_config(sname)? {
+                        if let Some(cmd) = cfg.command.first() {
+                            if which::which(cmd).is_err() {
+                                tracing::warn!("Multi-server '{}': command '{}' not found, skipping", sname, cmd);
+                                continue;
+                            }
+                        }
+                        let server_key = format!("{}#{}", cfg.name, project_path.display());
+                        let enable_diag = diagnostics_servers.contains(sname);
+                        let server = if let Some(s) = self.lsp_servers.get(&server_key) {
+                            s.clone()
+                        } else {
+                            let s = self.create_lsp_server(&cfg, &project_path, enable_diag).await?;
+                            self.lsp_servers.insert(server_key, s.clone());
+                            s
+                        };
+
+                        // Send didOpen for each server
+                        let ext = filepath_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                        let language_id = self.get_language_id(filepath, &cfg, &ext).await;
+                        let uri = lsp_server::server::path_to_uri(filepath_path);
+                        let text = std::fs::read_to_string(filepath).unwrap_or_default();
+                        let _ = server.send_did_open(&uri, &language_id, 0, &text);
+                        tracing::info!("didOpen {} on '{}' as languageId={}", filepath, sname, language_id);
+
+                        multi_servers.insert(cfg.name.clone(), server);
+                    }
+                }
+
+                if !multi_servers.is_empty() {
+                    if let Some(emacs) = &self.emacs {
+                        let _ = emacs.message_emacs(&format!(
+                            "Active {} '{}', enjoy hacking!",
+                            if project_path.is_dir() { "project" } else { "file" },
+                            project_path.file_name().unwrap_or_default().to_string_lossy()
+                        )).await;
+                    }
+
+                    let mut file_action = FileAction::new(filepath.to_string());
+                    file_action.multi_servers = Some(multi_servers);
+                    file_action.multi_servers_info = Some(multi_config);
+                    self.file_actions.insert(filepath.to_string(), Arc::new(file_action));
+                    return Ok(true);
+                }
+                // If no multi-server succeeded, fall through to single
+            }
+        }
+
+        // Single-server path
+        let server_name = single_server_name
             .or_else(|| {
-                // Last resort: extension-based lookup
                 let ext = filepath_path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 self.find_server_config_by_extension(ext).map(|c| c.name.clone())
             });
@@ -215,9 +279,7 @@ impl LspBridge {
 
         tracing::info!("Opening {} with server '{}' in project {}", filepath, server_name, project_path.display());
 
-        // Load server config
-        let config = self.load_server_config(&server_name)?;
-        let config = match config {
+        let config = match self.load_server_config(&server_name)? {
             Some(c) => c,
             None => {
                 tracing::error!("Server config not found: {}", server_name);
@@ -225,7 +287,6 @@ impl LspBridge {
             }
         };
 
-        // Check command exists
         if let Some(cmd) = config.command.first() {
             if which::which(cmd).is_err() {
                 tracing::error!("LSP server command not found: {}", cmd);
@@ -237,15 +298,11 @@ impl LspBridge {
         }
 
         let server_key = format!("{}#{}", config.name, project_path.display());
-
-        // Reuse existing server or create new one
         let lsp_server = if let Some(server) = self.lsp_servers.get(&server_key) {
             server.clone()
         } else {
             let server = self.create_lsp_server(&config, &project_path, true).await?;
             self.lsp_servers.insert(server_key, server.clone());
-
-            // Notify user
             if let Some(emacs) = &self.emacs {
                 let _ = emacs.message_emacs(&format!(
                     "Active {} '{}', enjoy hacking!",
@@ -253,12 +310,9 @@ impl LspBridge {
                     project_path.file_name().unwrap_or_default().to_string_lossy()
                 )).await;
             }
-
             server
         };
 
-        // Determine language ID — mirrors Python's get_language_id().
-        // Priority: 1) Ask Emacs  2) languageIds map  3) config.languageId  4) extension
         let ext = filepath_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
         let language_id = self.get_language_id(filepath, &config, &ext).await;
         tracing::info!("didOpen {} as languageId={}", filepath, language_id);
@@ -267,7 +321,6 @@ impl LspBridge {
         let text = std::fs::read_to_string(filepath).unwrap_or_default();
         lsp_server.send_did_open(&uri, &language_id, 0, &text)?;
 
-        // Create file action
         let mut file_action = FileAction::new(filepath.to_string());
         file_action.single_server = Some(lsp_server);
         file_action.single_server_info = Some(config);
