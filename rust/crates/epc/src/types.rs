@@ -684,17 +684,12 @@ mod tests {
 
     #[test]
     fn transform_empty_list() {
-        // Python: empty list → empty dict (for compatibility)
-        // But our implementation returns empty array since is_keyword_plist returns false
-        // This matches: len(arg) % 2 == 0 is True for empty, but the loop check fails
-        // Actually in Python, empty list with even length passes the dict check
-        // but there are no elements to iterate, so it returns empty dict.
-        // Our implementation: empty list → not a plist (len==0, check returns false) → array
-        // This is a known difference. In practice empty lists are rare in EPC.
+        // Python ground truth: epc_arg_transformer([]) → {} (empty dict)
+        // Python's logic: len([]) % 2 == 0 is True, loop over [::2] doesn't execute,
+        // so type_dict_p stays True, returns empty dict
         let list = SexpValue::List(vec![]);
         let result = epc_arg_transformer(&list);
-        // Accept either [] or {} since Python returns {} but both work
-        assert!(result == serde_json::json!([]) || result == serde_json::json!({}));
+        assert_eq!(result, serde_json::json!({}));
     }
 
     // ===== build_eval_in_emacs tests (Python parity) =====
@@ -800,5 +795,116 @@ mod tests {
             convert_emacs_bool(&SexpValue::Integer(42), false),
             serde_json::json!(42)
         );
+    }
+
+    // ===== Python ground truth: handle_arg_types edge cases =====
+    // Generated from: uv run python3 -c "import sexpdata; handle_arg_types(...)"
+
+    #[test]
+    fn python_handle_arg_integer() {
+        // Python: handle_arg_types(42) → Quoted(42) → dumps = "'42"
+        let result = build_eval_in_emacs("f", &[EvalArg::Integer(42)]);
+        assert_eq!(result, "(f '42)");
+    }
+
+    #[test]
+    fn python_handle_arg_float() {
+        // Python: handle_arg_types(3.14) → Quoted(3.14) → dumps = "'3.14"
+        let result = build_eval_in_emacs("f", &[EvalArg::Float(3.14)]);
+        assert_eq!(result, "(f '3.14)");
+    }
+
+    #[test]
+    fn python_handle_arg_bool_true() {
+        // Python: handle_arg_types(True) → Quoted(True) → dumps = "'t"
+        let result = build_eval_in_emacs("f", &[EvalArg::Bool(true)]);
+        assert_eq!(result, "(f 't)");
+    }
+
+    #[test]
+    fn python_handle_arg_bool_false() {
+        // Python: handle_arg_types(False) → Quoted(False) → sexpdata.dumps(Quoted(False)) = "'()"
+        // Note: Python False → sexpdata dumps as "()" (nil/empty list)
+        let result = build_eval_in_emacs("f", &[EvalArg::Bool(false)]);
+        assert_eq!(result, "(f 'nil)");
+    }
+
+    #[test]
+    fn python_handle_arg_list() {
+        // Python: handle_arg_types([1, 2, 3]) → Quoted([1,2,3]) → "'(1 2 3)"
+        let result = build_eval_in_emacs(
+            "f",
+            &[EvalArg::List(vec![
+                SexpValue::Integer(1),
+                SexpValue::Integer(2),
+                SexpValue::Integer(3),
+            ])],
+        );
+        assert_eq!(result, "(f '(1 2 3))");
+    }
+
+    #[test]
+    fn python_handle_arg_empty_string() {
+        // Python: handle_arg_types('') → Quoted('') → "'\"\""
+        let result = build_eval_in_emacs("f", &[EvalArg::String(String::new())]);
+        assert_eq!(result, "(f '\"\")");
+    }
+
+    #[test]
+    fn python_handle_arg_string_with_apostrophe() {
+        // Python: handle_arg_types("it's") → Quoted("it's") → "'\"it's\""
+        let result = build_eval_in_emacs("f", &[EvalArg::String("it's".to_string())]);
+        assert_eq!(result, "(f '\"it's\")");
+    }
+
+    // ===== Python ground truth: epc_arg_transformer edge cases =====
+
+    #[test]
+    fn python_transform_mixed_no_keyword() {
+        // Python: [1, Symbol(':a')] has even length but first element is not keyword
+        // → type_dict_p stays True initially but fails on first non-keyword check
+        // Actually: arg[::2] = [1], and isinstance(1, Symbol) is False → type_dict_p = False
+        // → returns list [1, Symbol(':a')]
+        let list = SexpValue::List(vec![
+            SexpValue::Integer(1),
+            SexpValue::Keyword(":a".to_string()),
+        ]);
+        let result = epc_arg_transformer(&list);
+        // Not a keyword plist because first element (1) is not a keyword
+        assert_eq!(result, serde_json::json!([1, ":a"]));
+    }
+
+    // ===== Python ground truth: sexpdata.dumps edge cases =====
+
+    #[test]
+    fn python_sexpdata_dumps_none() {
+        // Python: sexpdata.dumps(None) → "()"
+        // In our model, None maps to Nil which serializes as "nil"
+        // But Python's sexpdata.dumps(None) returns "()" because None → []
+        // This is a sexpdata quirk. Our serialize(Nil) = "nil" which is correct Elisp.
+        // The difference is acceptable: Emacs reads both "nil" and "()" as nil.
+        let result = sexp::serialize(&SexpValue::Nil);
+        assert_eq!(result, "nil");
+    }
+
+    #[test]
+    fn python_sexpdata_dumps_true() {
+        // Python: sexpdata.dumps(True) → "t"
+        let result = sexp::serialize(&SexpValue::Bool(true));
+        assert_eq!(result, "t");
+    }
+
+    #[test]
+    fn python_sexpdata_dumps_zero() {
+        // Python: sexpdata.dumps(0) → "0"
+        let result = sexp::serialize(&SexpValue::Integer(0));
+        assert_eq!(result, "0");
+    }
+
+    #[test]
+    fn python_sexpdata_dumps_neg_zero_float() {
+        // Python: sexpdata.dumps(-0.0) → "-0.0"
+        let result = sexp::serialize(&SexpValue::Float(-0.0));
+        assert_eq!(result, "-0.0");
     }
 }

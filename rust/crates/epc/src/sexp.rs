@@ -595,9 +595,17 @@ impl SexpValue {
 }
 
 /// Check if a list is a keyword plist (even length, alternating keywords and values).
+///
+/// Matches Python's epc_arg_transformer behavior:
+/// - Empty list → True (Python treats empty list as empty dict for compatibility)
+/// - Even-length list where every other element is a keyword → True
 fn is_keyword_plist(items: &[SexpValue]) -> bool {
-    if items.is_empty() || items.len() % 2 != 0 {
+    if items.len() % 2 != 0 {
         return false;
+    }
+    // Empty list: Python returns {} (dict), so we return true
+    if items.is_empty() {
+        return true;
     }
     items.iter().step_by(2).all(|v| matches!(v, SexpValue::Keyword(_)))
 }
@@ -1335,10 +1343,10 @@ mod tests {
 
     #[test]
     fn sexp_to_json_empty_list() {
-        // Empty list → JSON array (not object, since we can't detect plist)
+        // Python: epc_arg_transformer([]) → {} (empty dict, for compatibility)
         let list = SexpValue::List(vec![]);
         let json = list.to_json();
-        assert_eq!(json, serde_json::json!([]));
+        assert_eq!(json, serde_json::json!({}));
     }
 
     #[test]
