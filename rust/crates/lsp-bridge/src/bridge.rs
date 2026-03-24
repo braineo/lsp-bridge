@@ -453,6 +453,10 @@ impl LspBridge {
                 continue;
             }
 
+            tracing::debug!("handler '{}' got response ({} bytes)",
+                method,
+                serde_json::to_string(&response).map(|s| s.len()).unwrap_or(0));
+
             let server_names = file_action.get_server_names();
             let response_ctx = ResponseContext {
                 filepath: filepath.clone(),
